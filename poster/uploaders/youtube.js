@@ -36,10 +36,8 @@ const SELECTORS = {
 async function launchBrowser(headless) {
     return chromium.launchPersistentContext(PROFILE_DIR, {
         headless,
-        channel: 'chrome',           // Usa o Chrome instalado no sistema
         args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-        // Simula resolução comum de monitor
-        viewport: { width: 1280, height: 900 },
+        viewport: headless ? { width: 1280, height: 900 } : null,
     });
 }
 

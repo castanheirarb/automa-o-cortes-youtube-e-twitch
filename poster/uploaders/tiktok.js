@@ -26,11 +26,11 @@ const SELECTORS = {
 async function launchBrowser(headless) {
     return chromium.launchPersistentContext(PROFILE_DIR, {
         headless,
-        channel: 'chrome',
         args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-        viewport: { width: 1280, height: 900 },
+        viewport: headless ? { width: 1280, height: 900 } : null,
     });
 }
+
 
 async function humanClick(page, selector, timeout = 15000) {
     const el = await page.waitForSelector(selector, { timeout, state: 'visible' });
