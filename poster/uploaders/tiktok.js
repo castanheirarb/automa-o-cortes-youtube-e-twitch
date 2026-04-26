@@ -6,28 +6,34 @@ import { chromium } from 'playwright';
 import path from 'node:path';
 import { logger } from '../logger.js';
 
+// Perfil persistente do Playwright — sessão salva com npm run poster:login
+// Usa o Chrome real como executável para máxima compatibilidade.
 const PROFILE_DIR = path.resolve('./profiles/chrome-tiktok');
 
+const CHROME_EXEC = process.env.CHROME_PATH
+    || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+
 // Seletores do TikTok Upload Studio
-// URL: https://www.tiktok.com/creator-center/upload
 const SELECTORS = {
-    // Frame do uploader (TikTok usa iframe para o formulário de upload)
     uploaderFrame: 'iframe[src*="creator-center"]',
-    // Input de arquivo dentro do iframe
     fileInput: 'input[type="file"]',
-    // Campo de legenda/título
     captionInput: '[data-text="true"], .public-DraftEditor-content, .DraftEditor-editorContainer [contenteditable="true"]',
-    // Botão "Postar" / "Post"
     postBtn: 'button[data-e2e="post-btn"], button:has-text("Postar"), button:has-text("Post")',
-    // Indicador de upload concluído (barra de progresso sumiu)
     uploadDone: '[class*="upload-card--container"] [class*="checkmark"], [data-e2e="video-upload-icon"]',
 };
 
-async function launchBrowser(headless) {
+async function launchBrowser() {
+    logger.info(`[TikTok] Perfil: ${PROFILE_DIR}`);
     return chromium.launchPersistentContext(PROFILE_DIR, {
-        headless,
-        args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
-        viewport: headless ? { width: 1280, height: 900 } : null,
+        executablePath: CHROME_EXEC,
+        headless: false, // TikTok bloqueia upload headless
+        args: [
+            '--no-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=IsolateOrigins,site-per-process',
+        ],
+        viewport: null,
+        ignoreDefaultArgs: ['--enable-automation'],
     });
 }
 
@@ -43,7 +49,6 @@ async function humanClick(page, selector, timeout = 15000) {
  * O TikTok Creator Center envolve o formulário em um iframe.
  */
 async function getUploadFrame(page) {
-    // Tenta encontrar um iframe do uploader
     await page.waitForTimeout(2000);
     const frames = page.frames();
     const uploaderFrame = frames.find((f) => f.url().includes('creator-center') || f.url().includes('tiktok'));
@@ -58,13 +63,14 @@ async function getUploadFrame(page) {
  * @param {string} filePath
  * @param {string} caption  - Legenda com hashtags
  * @param {boolean} headless
- * @returns {Promise<boolean>}
+ * @returns {Promise<boolean>} true = publicado com sucesso confirmado; false = falhou
  */
 export async function uploadToTikTok(filePath, caption, headless = true) {
     logger.step(`[TikTok] Iniciando upload: ${path.basename(filePath)}`);
 
-    const context = await launchBrowser(headless);
+    const context = await launchBrowser();
     const page = await context.newPage();
+    let uploaded = false; // Só true se a URL mudar para a página de conteúdo
 
     try {
         // 1. Vai direto para a página de upload do Creator Center
@@ -86,40 +92,121 @@ export async function uploadToTikTok(filePath, caption, headless = true) {
         });
         await fileInput.setInputFiles(filePath);
 
-        // 4. Aguarda o upload processar (barra de progresso)
-        logger.info('[TikTok] Aguardando processamento do vídeo...');
-        await page.waitForTimeout(8000); // Margem inicial para o upload iniciar
+        // 4. Aguarda o processamento — estratégia robusta:
+        // Em vez de esperar um indicador visual (seletor frágil),
+        // esperamos o campo de legenda ficar disponível e interagível,
+        // o que só acontece DEPOIS que o vídeo terminou de processar.
+        logger.info('[TikTok] Aguardando processamento do vídeo (até 5 min)...');
+        await page.waitForTimeout(5000); // pausa inicial para o iframe montar
 
-        // Aguarda até 3 minutos pelo processamento completo
-        await frame.waitForSelector(SELECTORS.uploadDone, {
-            timeout: 180000,
-            state: 'visible',
-        }).catch(() => {
-            logger.warn('[TikTok] Timeout no sinal de conclusão do upload — tentando continuar...');
-        });
+        const CAPTION_SELECTORS = [
+            '[data-text="true"]',
+            '.public-DraftEditor-content',
+            '.DraftEditor-editorContainer [contenteditable="true"]',
+            '[contenteditable="true"][spellcheck]',
+            'div[contenteditable="true"]',
+        ];
 
-        // 5. Preenche a legenda (caption) com o título + hashtags
+        let captionEl = null;
+        const MAX_WAIT_MS = 5 * 60 * 1000; // 5 minutos
+        const POLL_MS = 5_000;
+        const startTime = Date.now();
+
+        while (!captionEl && Date.now() - startTime < MAX_WAIT_MS) {
+            // Tenta re-obter o frame a cada iteração (TikTok pode recarregar o iframe)
+            const currentFrame = await getUploadFrame(page);
+
+            for (const sel of CAPTION_SELECTORS) {
+                try {
+                    const el = await currentFrame.waitForSelector(sel, { timeout: 3000, state: 'visible' });
+                    if (el) { captionEl = el; break; }
+                } catch { /* tenta o próximo */ }
+            }
+
+            if (!captionEl) {
+                const elapsed = Math.round((Date.now() - startTime) / 1000);
+                logger.info(`[TikTok] Processando... ${elapsed}s / ${MAX_WAIT_MS / 1000}s`);
+                await page.waitForTimeout(POLL_MS);
+            }
+        }
+
+        if (!captionEl) {
+            throw new Error('Vídeo não processou em 5 minutos — TikTok pode estar com lentidão.');
+        }
+
+        // 5. Preenche a legenda
+        // Re-obtém o frame e o elemento para evitar referência stale após o poll loop.
+        // O TikTok usa Draft.js (editor rico contenteditable): o texto deve ser
+        // digitado via page.keyboard.type() (nível de página), não element.type(),
+        // pois Draft.js só reconhece eventos de teclado disparados no documento.
         logger.info('[TikTok] Preenchendo legenda...');
-        const captionEl = await frame.waitForSelector(SELECTORS.captionInput, { timeout: 15000 });
-        await captionEl.click({ clickCount: 3 });
-        await captionEl.fill(''); // Limpa
+        const uploadFrame = await getUploadFrame(page);
+
+        let captionInput = null;
+        for (const sel of CAPTION_SELECTORS) {
+            try {
+                const el = await uploadFrame.waitForSelector(sel, { timeout: 5000, state: 'visible' });
+                if (el) { captionInput = el; break; }
+            } catch { /* tenta o próximo */ }
+        }
+
+        if (!captionInput) throw new Error('Campo de legenda não encontrado após processamento do vídeo.');
+
+        // Foca o campo e limpa o conteúdo existente
+        await captionInput.click();
+        await page.waitForTimeout(500);
+        await page.keyboard.press('Control+a');
+        await page.waitForTimeout(150);
+        await page.keyboard.press('Delete');
         await page.waitForTimeout(300);
-        await captionEl.type(caption, { delay: 40 + Math.random() * 60 });
+
+        // Digita via page.keyboard para que o Draft.js receba os eventos corretamente
+        const captionTrimmed = caption.slice(0, 2200);
+        await page.keyboard.type(captionTrimmed, { delay: 25 + Math.random() * 30 });
 
         // 6. Clica em "Postar"
         logger.info('[TikTok] Publicando...');
-        await page.waitForTimeout(1000);
-        await humanClick(frame, SELECTORS.postBtn, 20000);
+        await page.waitForTimeout(1500);
 
-        // 7. Aguarda redirecionamento ou confirmação
-        await Promise.race([
-            page.waitForURL('**/creator-center/content**', { timeout: 60000 }),
-            page.waitForURL('**/manage/posts**', { timeout: 60000 }),
-            page.waitForTimeout(30000), // Fallback
-        ]).catch(() => { });
+        const POST_BTN_SELECTORS = [
+            'button[data-e2e="post-btn"]',
+            'button:has-text("Postar")',
+            'button:has-text("Post")',
+            'button:has-text("Publicar")',
+            '[class*="btn-post"]',
+        ];
 
-        logger.success('[TikTok] ✅ Vídeo publicado com sucesso!');
-        return true;
+        let clicked = false;
+        for (const sel of POST_BTN_SELECTORS) {
+            try {
+                await uploadFrame.waitForSelector(sel, { timeout: 5000, state: 'visible' });
+                await uploadFrame.click(sel);
+                clicked = true;
+                logger.info(`[TikTok] Botão publicar clicado (${sel})`);
+                break;
+            } catch { /* tenta o próximo */ }
+        }
+
+        if (!clicked) throw new Error('Botão de publicar não encontrado após processar vídeo.');
+
+        // 7. Aguarda redirecionamento real
+        const redirectResult = await Promise.race([
+            page.waitForURL('**/creator-center/content**', { timeout: 60000 }).then(() => 'content'),
+            page.waitForURL('**/manage/posts**', { timeout: 60000 }).then(() => 'posts'),
+            page.waitForURL('**/creator-center/upload**', { timeout: 60000 }).then(() => 'upload_again'),
+        ]).catch(() => 'timeout');
+
+        if (redirectResult === 'content' || redirectResult === 'posts') {
+            uploaded = true;
+            logger.success('[TikTok] ✅ Vídeo publicado com sucesso!');
+        } else if (redirectResult === 'upload_again') {
+            logger.warn('[TikTok] Redirecionou para upload novamente — verifique manualmente.');
+        } else {
+            logger.warn(`[TikTok] Sem redirecionamento confirmado (${redirectResult}) — verifique manualmente.`);
+        }
+
+        return uploaded;
+
 
     } catch (err) {
         logger.error(`[TikTok] Falha no upload: ${err.message}`);
@@ -127,7 +214,7 @@ export async function uploadToTikTok(filePath, caption, headless = true) {
         return false;
 
     } finally {
-        await page.waitForTimeout(2000);
-        await context.close();
+        await page.waitForTimeout(2000).catch(() => {});
+        await context.close().catch(() => {});
     }
 }

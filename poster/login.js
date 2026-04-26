@@ -9,11 +9,14 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { logger } from './logger.js';
 
+const CHROME_EXEC = process.env.CHROME_PATH
+    || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+
 const PLATFORMS = {
     youtube: {
         profileDir: path.resolve('./profiles/chrome-youtube'),
-        url: 'https://accounts.google.com/ServiceLogin?service=youtube',
-        name: 'YouTube',
+        url: 'https://studio.youtube.com',
+        name: 'YouTube Studio',
     },
     tiktok: {
         profileDir: path.resolve('./profiles/chrome-tiktok'),
@@ -22,44 +25,38 @@ const PLATFORMS = {
     },
 };
 
-/**
- * Aguarda o usuário pressionar ENTER no terminal.
- */
 function waitForEnter(message) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     return new Promise((resolve) => {
-        rl.question(message, () => {
-            rl.close();
-            resolve();
-        });
+        rl.question(message, () => { rl.close(); resolve(); });
     });
 }
 
-/**
- * Abre o browser visível para uma plataforma e aguarda o ENTER do usuário.
- */
 async function loginToPlatform(key) {
     const { profileDir, url, name } = PLATFORMS[key];
 
-    logger.step(`Abrindo ${name}...`);
+    logger.step(`Abrindo ${name} para login manual...`);
 
     const context = await chromium.launchPersistentContext(profileDir, {
-        headless: false,                   // SEMPRE visível no login
-        args: ['--no-sandbox', '--start-maximized'],
-        viewport: null,                    // null = usa o tamanho real da janela
+        executablePath: CHROME_EXEC,
+        headless: false,
+        args: ['--no-sandbox', '--start-maximized', '--disable-blink-features=AutomationControlled'],
+        ignoreDefaultArgs: ['--enable-automation'],
+        viewport: null,
     });
 
     const page = await context.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded' });
 
-    logger.info(`Browser do ${name} aberto em: ${url}`);
+    logger.info(`${name} aberto. Faça login normalmente.`);
     await waitForEnter(
-        `\n  👉  Faça login no ${name} e pressione ENTER aqui quando terminar...\n`
+        `\n  👉  Faça login no ${name}, e quando estiver logado, pressione ENTER aqui...\n`
     );
 
     await context.close();
     logger.success(`Sessão do ${name} salva em: ${profileDir}\n`);
 }
+
 
 async function main() {
     const UPLOAD_YOUTUBE = process.env.UPLOAD_TO_YOUTUBE !== 'false';

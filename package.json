@@ -5,16 +5,33 @@
   "main": "src/index.js",
   "type": "module",
   "scripts": {
+    "start": "node start.js",
+    "start:no-live": "node start.js --no-live",
+    "start:no-poster": "node start.js --no-poster",
+    "cli": "node cli.js",
     "cut": "node src/index.js",
+    "capture": "node src/orchestrator.js",
+    "capture:force": "node src/orchestrator.js --force",
+    "live": "node src/orchestrator.js --live",
+    "full": "node src/orchestrator.js && node poster/index.js --now",
     "poster": "node poster/index.js",
-    "poster:login": "node poster/login.js"
+    "poster:now": "node poster/index.js --now",
+    "poster:tiktok": "node poster/index.js --now --tiktok-only",
+    "poster:youtube": "node poster/index.js --now --youtube-only",
+    "poster:dry": "node poster/index.js --dry-run",
+    "poster:login": "node poster/login.js",
+    "regen-captions": "node regen-captions.js"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
     "fluent-ffmpeg": "^2.1.3",
+    "groq-sdk": "^0.37.0",
     "node-cron": "^3.0.3",
-    "playwright": "^1.49.1"
+    "playwright": "^1.49.1",
+    "sharp": "^0.34.5",
+    "ws": "^8.19.0"
   },
   "engines": {
     "node": ">=18.0.0"
