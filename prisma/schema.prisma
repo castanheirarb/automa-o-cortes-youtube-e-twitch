@@ -1,0 +1,59 @@
+// prisma/schema.prisma
+// Banco de dados local (SQLite) para a Agenda Esportiva do CorteCerto.
+// Para inicializar:  npx prisma db push
+// Para ver dados:    npx prisma studio
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ── Agenda de Lives Esportivas ─────────────────────────────────────────────────
+//
+// Cada linha representa um jogo/evento que o Watchdog deve monitorar.
+// O Watchdog consulta essa tabela a cada 10 minutos e spawna o sports-radar.js
+// automaticamente quando o evento está a menos de 15 minutos de começar.
+//
+// status:
+//   PENDING   → aguardando início, será spawnado pelo Watchdog
+//   WATCHING  → radar ativo (spawnedPid contém o PID do processo filho)
+//   COMPLETED → gravação encerrada (tempo de jogo + 30min de tolerância expirou)
+//   FAILED    → erro ao iniciar ou resolver a URL
+
+model LiveSchedule {
+  id                    Int      @id @default(autoincrement())
+
+  // Canal a monitorar
+  // YouTube: "@CazeTV", "@CanalGOATBR"
+  // Twitch:  "gaules", "cazé"
+  channelAlias          String
+
+  // Plataforma de origem do chat e da live
+  platform              String   // "youtube" | "twitch"
+
+  // Quando o jogo começa (horário de Brasília — salvo como UTC no SQLite)
+  scheduledStartTime    DateTime
+
+  // Duração esperada em horas (Watchdog mata o radar com +30min de tolerância)
+  expectedDurationHours Int      @default(3)
+
+  // Sensibilidade do spike detector:
+  //   canais massivos (CazéTV ~1M live): 300
+  //   canais médios (~100k live):        100
+  //   canais menores (~20k live):         50
+  baseThreshold         Int      @default(50)
+
+  // Keywords do chat que indicam gol/momento relevante (vírgula separada)
+  keywords              String   @default("gol,golaço,goool,goooool,pqp,vaaai,vaaaaai,que golaço")
+
+  // Ciclo de vida gerenciado pelo Watchdog
+  status                String   @default("PENDING")
+  spawnedPid            Int?     // PID do processo sports-radar filho (preenchido ao spawnar)
+
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}

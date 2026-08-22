@@ -32,8 +32,8 @@ function waitForEnter(message) {
     });
 }
 
-async function loginToPlatform(key) {
-    const { profileDir, url, name } = PLATFORMS[key];
+async function loginToPlatform(key, override = null) {
+    const { profileDir, url, name } = override || PLATFORMS[key];
 
     logger.step(`Abrindo ${name} para login manual...`);
 
@@ -58,9 +58,33 @@ async function loginToPlatform(key) {
 }
 
 
+// ─── Login em conta extra (ex: replicar cortes em mais contas) ───────────────
+//
+// Uso: node poster/login.js --platform youtube --profile ./profiles/chrome-youtube-02
+// Depois de logar, adicione o mesmo profileDir em poster/accounts.js.
+
+function parseExtraAccountArgs(args) {
+    const platformIdx = args.indexOf('--platform');
+    const profileIdx = args.indexOf('--profile');
+    if (platformIdx === -1 || profileIdx === -1) return null;
+
+    const platform = args[platformIdx + 1];
+    const profileArg = args[profileIdx + 1];
+    if (!PLATFORMS[platform] || !profileArg) {
+        console.error(`\x1b[31mUso: node poster/login.js --platform youtube|tiktok --profile <caminho>\x1b[0m`);
+        process.exit(1);
+    }
+
+    return {
+        profileDir: path.resolve(profileArg),
+        url: PLATFORMS[platform].url,
+        name: `${PLATFORMS[platform].name} (conta extra)`,
+    };
+}
+
 async function main() {
-    const UPLOAD_YOUTUBE = process.env.UPLOAD_TO_YOUTUBE !== 'false';
-    const UPLOAD_TIKTOK = process.env.UPLOAD_TO_TIKTOK !== 'false';
+    const args = process.argv.slice(2);
+    const extraAccount = parseExtraAccountArgs(args);
 
     console.log('\n\x1b[35m' + '═'.repeat(52) + '\x1b[0m');
     console.log('\x1b[35m  🔐  CANAL CORTE — Login Manual\x1b[0m');
@@ -68,6 +92,16 @@ async function main() {
 
     logger.info('O browser será aberto visível para cada plataforma.');
     logger.info('Faça login normalmente e pressione ENTER no terminal para continuar.\n');
+
+    if (extraAccount) {
+        await loginToPlatform(null, extraAccount);
+        logger.success('✅ Login da conta extra concluído!');
+        logger.info(`Adicione este profileDir em poster/accounts.js: ${extraAccount.profileDir}`);
+        process.exit(0);
+    }
+
+    const UPLOAD_YOUTUBE = process.env.UPLOAD_TO_YOUTUBE !== 'false';
+    const UPLOAD_TIKTOK = process.env.UPLOAD_TO_TIKTOK !== 'false';
 
     if (UPLOAD_YOUTUBE) await loginToPlatform('youtube');
     if (UPLOAD_TIKTOK) await loginToPlatform('tiktok');

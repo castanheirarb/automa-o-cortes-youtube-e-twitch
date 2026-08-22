@@ -3,3 +3,19 @@ output/
 .env
 *.mp4
 *.json.tmp
+
+# Canal da Fé (subprojeto Python/Remotion)
+canal_da_fe/venv/
+canal_da_fe/browser_profile/
+canal_da_fe/token.json
+canal_da_fe/client_secrets.json
+canal_da_fe/assets/
+canal_da_fe/__pycache__/
+
+# Canal Infantil (subprojeto Python)
+canal_infantil/venv/
+canal_infantil/browser_profile/
+canal_infantil/assets/
+canal_infantil/output/
+canal_infantil/__pycache__/
+canal_infantil/.env

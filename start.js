@@ -2,10 +2,14 @@
 // Exibe logs de cada serviço com cores diferentes em tempo real.
 //
 // Uso:
-//   node start.js              → Inicia auto-poster + live monitor + scanner + trend hunter
-//   node start.js --no-live    → Sem monitor de lives
-//   node start.js --no-poster  → Sem auto-poster
-//   node start.js --no-hunter  → Sem trend hunter
+//   node start.js                  → Inicia auto-poster + live monitor + yt-monitor + scanner + trend hunter
+//   node start.js --no-live        → Sem monitor de lives Twitch
+//   node start.js --no-yt-monitor  → Sem monitor YouTube
+//   node start.js --no-poster      → Sem auto-poster
+//   node start.js --no-hunter      → Sem trend hunter
+//   node start.js --no-sports      → Sem sports monitor (canais de futebol)
+//   node start.js --no-stock       → Sem stock watcher (reposição automática)
+//   node start.js --no-comment-bot → Sem Comment Bot (resposta automática a comentários)
 //
 // Pressione Ctrl+C para encerrar todos os serviços.
 
@@ -17,15 +21,61 @@ import fs from 'node:fs';
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
-const noLive = args.includes('--no-live');
-const noPoster = args.includes('--no-poster');
-const noHunter = args.includes('--no-hunter');
+const noLive        = args.includes('--no-live');
+const noPoster      = args.includes('--no-poster');
+const noHunter      = args.includes('--no-hunter');
+const noYtMonitor   = args.includes('--no-yt-monitor');
+const noWatchdog    = args.includes('--no-watchdog');
+const noSports      = args.includes('--no-sports');
+const noStock       = args.includes("--no-stock");
+const noCommentBot  = args.includes('--no-comment-bot');
 const node = process.execPath;
+
+// ─── Instância Única ──────────────────────────────────────────────────────────
+// Impede que 2 execuções de start.js rodem ao mesmo tempo. Sem essa trava, cada
+// instância sobe seu próprio AUTO-POSTER com os mesmos horários de cron — nos
+// horários agendados, cada processo dispara seu próprio ciclo de upload e o
+// upload-lock só serializa o navegador, não evita que 2 vídeos diferentes sejam
+// publicados em sequência na mesma plataforma no mesmo horário.
+const INSTANCE_LOCK_PATH = path.resolve('./scheduler/start.lock');
+
+function isPidAlive(pid) {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function ensureSingleInstance() {
+    try {
+        if (fs.existsSync(INSTANCE_LOCK_PATH)) {
+            const lock = JSON.parse(fs.readFileSync(INSTANCE_LOCK_PATH, 'utf8'));
+            if (lock?.pid && isPidAlive(lock.pid)) {
+                console.error(`\x1b[31m❌ Já existe uma instância do CANAL CORTE rodando (PID ${lock.pid}, iniciada em ${lock.startedAt}).\x1b[0m`);
+                console.error('\x1b[31m   Encerre esse processo antes de iniciar outro (evita postagens duplicadas).\x1b[0m');
+                console.error(`\x1b[31m   Se o processo já morreu e o lock ficou preso, apague: ${INSTANCE_LOCK_PATH}\x1b[0m`);
+                process.exit(1);
+            }
+        }
+    } catch { /* lock corrompido — sobrescreve abaixo */ }
+
+    const dir = path.dirname(INSTANCE_LOCK_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(INSTANCE_LOCK_PATH, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+}
+
+function releaseSingleInstanceLock() {
+    try {
+        const lock = JSON.parse(fs.readFileSync(INSTANCE_LOCK_PATH, 'utf8'));
+        if (lock?.pid === process.pid) fs.unlinkSync(INSTANCE_LOCK_PATH);
+    } catch { /* já removido ou corrompido — ignora */ }
+}
+
+ensureSingleInstance();
 
 // ─── Cores por serviço ────────────────────────────────────────────────────────
 
 const SCAN_HOURS  = parseFloat(process.env.SCAN_INTERVAL_HOURS || '6');
 const HUNT_HOURS  = parseFloat(process.env.TREND_HUNT_HOURS    || '12');
+const STOCK_MINUTES = parseFloat(process.env.STOCK_CHECK_MINUTES || '30');
+const COMMENT_BOT_HOURS = parseFloat(process.env.COMMENT_BOT_HOURS || '24');
 
 const SERVICES = [
     {
@@ -61,6 +111,62 @@ const SERVICES = [
         cmd: [node, ['src/orchestrator.js', '--hunt']],
         enabled: !noHunter,
         restartDelay: HUNT_HOURS * 3600 * 1000,
+    },
+    {
+        id: 'YT-MONITOR',
+        label: '📺 YT MONITOR',
+        color: '\x1b[34m',   // azul
+        // Polling continuo dos canais YouTube das personas — detecta VODs novos em ~10min
+        cmd: [node, ['src/orchestrator.js', '--youtube-monitor']],
+        enabled: !noYtMonitor,
+        restartDelay: 15_000,
+    },
+    {
+        id: 'SPORTS-MONITOR',
+        label: '⚽ SPORTS MONITOR',
+        color: '\x1b[32m',   // verde
+        // Polling continuo dos canais de futebol (sports-channels.js) — detecta
+        // jogos completos novos e minera gols via chat replay/heatmap automaticamente.
+        cmd: [node, ['src/orchestrator.js', '--sports-monitor']],
+        enabled: !noSports,
+        restartDelay: 15_000,
+    },
+    {
+        id: 'STOCK',
+        label: '📦 STOCK WATCHER',
+        color: '\x1b[33m',   // amarelo
+        // Vigia de estoque: confere o nível de conteúdo de todas as fontes
+        // (personas, Canal da Fé, Trend Hunter, vídeos longos) e repõe o que
+        // estiver abaixo do mínimo (STOCK_MIN_*). Roda uma vez e encerra —
+        // reinicia a cada STOCK_CHECK_MINUTES (padrão 30min).
+        cmd: [node, ['src/stock-watcher.js']],
+        enabled: !noStock,
+        restartDelay: STOCK_MINUTES * 60 * 1000,
+    },
+    {
+        id: 'COMMENT-BOT',
+        label: '💬 COMMENT BOT',
+        color: '\x1b[36m',   // ciano
+        // Responde comentários novos do YouTube automaticamente via API (sem
+        // navegador/perfil Playwright) — ver COMMENT_BOT_* no .env. Começa em
+        // dry-run por padrão (COMMENT_BOT_DRY_RUN=true) até ser validado.
+        // Roda 1 passada e encerra (--once) — o launcher reinicia de
+        // COMMENT_BOT_HOURS em COMMENT_BOT_HOURS (padrão 24h = 1x/dia),
+        // mesmo padrão do Scanner/Trend Hunter/Stock Watcher acima.
+        cmd: [node, ['src/orchestrator.js', '--comment-monitor', '--once']],
+        enabled: !noCommentBot,
+        restartDelay: COMMENT_BOT_HOURS * 3600 * 1000,
+    },
+    {
+        id: 'WATCHDOG',
+        label: '⚽ WATCHDOG',
+        color: '\x1b[32m',   // verde
+        // Agenda esportiva: consulta o banco a cada 10min e spawna o Radar
+        // automaticamente quando um jogo agendado começa.
+        // Para agendar: npm run radar:add -- "@CazeTV" youtube "2025-06-20 21:00" 4
+        cmd: [node, ['src/capturer/watchdog.js']],
+        enabled: !noWatchdog,
+        restartDelay: 30_000,
     },
 ];
 
@@ -163,6 +269,7 @@ function shutdown() {
     }
 
     setTimeout(() => {
+        releaseSingleInstanceLock();
         sysLog('Tudo encerrado. Até logo!');
         process.exit(0);
     }, 2000);

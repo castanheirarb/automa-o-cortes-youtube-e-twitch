@@ -15,10 +15,25 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { logger } from '../utils/logger.js';
 import { sanitizeFilename, formatDuration } from '../utils/helpers.js';
 import { addCaptionsToClip } from './captions.js';
-import { detectCropXPosition } from './face-detect.js';
+import { detectCropXPosition, detectSceneLayout } from './face-detect.js';
+import { findSmartEndTime } from './smart-boundary.js';
+
+// ─── Erros customizados ───────────────────────────────────────────────────────
+
+/**
+ * Lançado quando o yt-dlp encontra um VOD subscriber-only na Twitch.
+ * Capturado pelo capturer.js para acionar o fallback omnichannel (Twitch → YouTube).
+ */
+export class SubscriberOnlyError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'SubscriberOnlyError';
+    }
+}
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -52,15 +67,49 @@ function configureBinaries() {
  * @returns {Promise<{ videoStreamUrl: string, audioStreamUrl: string|null }>}
  */
 async function getStreamUrls(videoUrl) {
+    // O Live Monitor (src/capturer/live-monitor.js) passa o caminho do arquivo
+    // JÁ GRAVADO localmente como videoUrl (a live foi capturada com antecedência,
+    // não precisa resolver URL nenhuma). Sem essa checagem, o código tentava rodar
+    // `yt-dlp --get-url` num caminho de arquivo local, o que sempre falhava.
+    // Arquivo local já tem vídeo+áudio no mesmo stream — não precisa de audioStreamUrl.
+    if (!/^https?:\/\//i.test(videoUrl) && fs.existsSync(videoUrl)) {
+        logger.info('[FFmpeg] videoUrl é um arquivo local — pulando resolução via yt-dlp.');
+        return { videoStreamUrl: videoUrl, audioStreamUrl: null };
+    }
+
     const ytDlp = process.env.YTDLP_PATH?.trim() || 'yt-dlp';
     logger.info('Obtendo URLs de stream via yt-dlp...');
 
-    const { stdout } = await execFileAsync(ytDlp, [
+    const ytDlpArgs = [
         '--get-url',
+        '--extractor-args', 'youtube:player_client=android',
         '--format', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
         '--no-playlist',
-        videoUrl,
-    ]);
+    ];
+
+    // Para VODs subscriber-only da Twitch, usa arquivo de cookies exportado.
+    // Exporte uma vez: instale "Get cookies.txt LOCALLY" no Chrome, acesse twitch.tv logado
+    // e salve como ./twitch-cookies.txt na raiz do projeto.
+    if (videoUrl.includes('twitch.tv')) {
+        const cookiesFile = path.resolve('./twitch-cookies.txt');
+        if (fs.existsSync(cookiesFile)) {
+            ytDlpArgs.push('--cookies', cookiesFile);
+        }
+    }
+
+    ytDlpArgs.push(videoUrl);
+
+    let stdout;
+    try {
+        ({ stdout } = await execFileAsync(ytDlp, ytDlpArgs));
+    } catch (err) {
+        // Detecta VOD subscriber-only para acionar fallback omnichannel
+        const output = (err.stderr || '') + (err.stdout || '') + err.message;
+        if (output.includes('subscriber-only') || output.includes('must be logged into an account')) {
+            throw new SubscriberOnlyError(`VOD subscriber-only: ${videoUrl}`);
+        }
+        throw err;
+    }
 
     const lines = stdout.trim().split('\n').map((l) => l.trim()).filter(Boolean);
 
@@ -113,27 +162,79 @@ function ffmpegEscapePath(p) {
  * @param {string}      tempPath    - caminho do arquivo de saída temporário
  * @returns {Promise<void>}
  */
-function downloadRawClip(videoStreamUrl, audioStreamUrl, startTime, endTime, tempPath) {
+async function downloadRawClip(videoStreamUrl, audioStreamUrl, startTime, endTime, tempPath) {
     const duration = endTime - startTime;
     logger.info(`Baixando segmento bruto (${formatDuration(duration)}) para análise ASD...`);
 
+    // Vídeo e áudio em URLs separadas (YouTube) exigem alinhamento explícito.
+    // Com `-c copy`, o seek do VÍDEO cai no keyframe anterior ao ponto pedido
+    // (até ~5s antes), enquanto o ÁUDIO é buscado com precisão. O resultado era
+    // um clipe começando com vários segundos SEM SOM. Aqui o áudio é buscado a
+    // partir do instante real onde o keyframe caiu, deixando os dois em sincronia.
+    if (audioStreamUrl) {
+        return downloadRawClipAligned(videoStreamUrl, audioStreamUrl, startTime, duration, tempPath);
+    }
+
+    // Stream único (Twitch/HLS ou arquivo local): ambos já saem alinhados.
     return new Promise((resolve, reject) => {
-        const cmd = ffmpeg();
-
-        cmd.input(videoStreamUrl).inputOptions([`-ss ${startTime}`, `-t ${duration}`]);
-
-        if (audioStreamUrl) {
-            cmd.input(audioStreamUrl).inputOptions([`-ss ${startTime}`, `-t ${duration}`]);
-            cmd.outputOptions(['-map 0:v:0', '-map 1:a:0']);
-        }
-
-        cmd
+        ffmpeg()
+            .input(videoStreamUrl)
+            .inputOptions([`-ss ${startTime}`, `-t ${duration}`])
             .outputOptions(['-c copy', '-avoid_negative_ts make_zero', '-y'])
             .output(tempPath)
             .on('end', resolve)
             .on('error', (err) => reject(new Error(`FFmpeg (download bruto): ${err.message}`)))
             .run();
     });
+}
+
+/**
+ * Baixa vídeo e áudio de URLs separadas garantindo sincronia:
+ *   1. Baixa o vídeo com -copyts (preserva os timestamps originais)
+ *   2. Descobre em que instante o keyframe realmente caiu
+ *   3. Baixa o áudio a partir DESSE instante
+ *   4. Junta os dois (sem re-encode)
+ */
+async function downloadRawClipAligned(videoStreamUrl, audioStreamUrl, startTime, duration, tempPath) {
+    const ffmpegBin  = process.env.FFMPEG_PATH?.trim()  || 'ffmpeg';
+    const ffprobeBin = process.env.FFPROBE_PATH?.trim() || 'ffprobe';
+    const stamp = Date.now();
+    const tmpV = path.join(os.tmpdir(), `raw-v-${stamp}.mp4`);
+    const tmpA = path.join(os.tmpdir(), `raw-a-${stamp}.m4a`);
+
+    try {
+        await execFileAsync(ffmpegBin, [
+            '-ss', String(startTime), '-t', String(duration), '-i', videoStreamUrl,
+            '-map', '0:v:0', '-c', 'copy', '-copyts', '-y', tmpV,
+        ], { maxBuffer: 100 * 1024 * 1024 });
+
+        const { stdout } = await execFileAsync(ffprobeBin, [
+            '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=start_time', '-of', 'csv=p=0', tmpV,
+        ]);
+        const realStart = parseFloat(stdout.trim());
+
+        if (!Number.isFinite(realStart)) {
+            throw new Error('não foi possível ler o timestamp inicial do vídeo');
+        }
+        const drift = startTime - realStart;
+        if (Math.abs(drift) > 0.05) {
+            logger.info(`[Sync] Keyframe caiu ${drift.toFixed(2)}s antes do ponto pedido — buscando áudio a partir de ${realStart.toFixed(2)}s.`);
+        }
+
+        await execFileAsync(ffmpegBin, [
+            '-ss', String(realStart), '-t', String(duration), '-i', audioStreamUrl,
+            '-map', '0:a:0', '-c', 'copy', '-y', tmpA,
+        ], { maxBuffer: 100 * 1024 * 1024 });
+
+        await execFileAsync(ffmpegBin, [
+            '-i', tmpV, '-i', tmpA,
+            '-map', '0:v:0', '-map', '1:a:0',
+            '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-shortest', '-y', tempPath,
+        ], { maxBuffer: 100 * 1024 * 1024 });
+    } finally {
+        cleanupFiles(tmpV, tmpA);
+    }
 }
 
 // ─── Etapa 2: Active Speaker Detection (Python/MediaPipe) ───────────────────
@@ -227,9 +328,11 @@ function runAsdPython(videoPath, cmdsPath) {
  * @param {string}      outputPath
  * @param {number}      cropXPercent   - posição horizontal do rosto [0.0–1.0]
  */
-function runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, outputPath, cropXPercent = 0.5, useBlurBackground = false) {
+function runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, outputPath, cropXPercent = 0.5, layoutMode = 'split') {
     const duration = endTime - startTime;
     const safeX = Math.min(1, Math.max(0, cropXPercent));
+    const useBlurBackground = layoutMode === 'blur';
+    const useHybrid = layoutMode === 'hybrid';
 
     // Fade-out de 1.5s no final do áudio
     const fadeD = 1.5;
@@ -239,13 +342,14 @@ function runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, output
     // Quando retorna um stream único (best), o áudio está em [0:a].
     const audioRef = audioStreamUrl ? '[1:a]' : '[0:a]';
 
-    const modeLabel = useBlurBackground ? 'blur-background' : 'split-screen';
+    const modeLabel = layoutMode;
     logger.step(`Cortando ${modeLabel} 1080×1920 (${formatDuration(duration)})...`);
 
     // Cadeia de áudio compartilhada entre os dois modos
     const audioChain =
         `${audioRef}aresample=async=1:min_hard_comp=0.100000:first_pts=0,` +
         `loudnorm=I=-16:TP=-1.5:LRA=11,` +
+        `atrim=duration=${duration},asetpts=PTS-STARTPTS,` +
         `afade=t=out:st=${fadeOutStart}:d=${fadeD}[outa]`;
 
     return new Promise((resolve, reject) => {
@@ -265,7 +369,30 @@ function runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, output
         // Todos os filtros em um único grafo → nenhum conflito com -vf ou -map.
         let filterStr;
 
-        if (useBlurBackground) {
+        if (useHybrid) {
+            // ── Modo: Híbrido "cortes de gameplay" ────────────────────────────
+            // O frame 16:9 COMPLETO (1080×608, pixels nativos, zero upscale)
+            // ancorado no terço superior; o restante do quadro é área de design
+            // — fundo desfocado escurecido onde as legendas queimadas ficam
+            // grandes e legíveis, sem cobrir o jogo.
+            //
+            //  y=380 posiciona o painel logo abaixo do topo seguro do Shorts
+            //  (onde o app sobrepõe título/avatar) e deixa ~930px livres embaixo.
+            const PANEL_Y = parseInt(process.env.HYBRID_PANEL_Y || '380', 10);
+            filterStr = [
+                `[0:v]split=2[bg_src][fg_src]`,
+                // Fundo: cobre 1080×1920, desfoque pesado + escurecido (destaca o painel)
+                `[bg_src]scale=-2:1920,crop=1080:1920:(iw-1080)/2:0,boxblur=24:24,` +
+                    `eq=brightness=-0.18:saturation=0.7,setsar=1/1[bg]`,
+                // Frente: gameplay em largura nativa 1080 (16:9 → 1080×608)
+                `[fg_src]scale=1080:-2,setsar=1/1[fg]`,
+                // Painel ancorado no topo + linha divisória sutil
+                `[bg][fg]overlay=(W-w)/2:${PANEL_Y},` +
+                    `drawbox=x=0:y=${PANEL_Y - 3}:w=iw:h=3:color=white@0.35:t=fill,` +
+                    `setsar=1/1,trim=duration=${duration},setpts=PTS-STARTPTS[outv]`,
+                audioChain,
+            ].join(';');
+        } else if (useBlurBackground) {
             // ── Modo: Fundo Desfocado (Blurred Background Padding) ────────────
             // Preserva o frame 16:9 COMPLETO. Sem corte de laterais, sem distorção.
             //
@@ -277,29 +404,33 @@ function runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, output
                 // Duplica o stream em dois ramos: fundo e frente
                 `[0:v]split=2[bg_src][fg_src]`,
                 // Fundo: escala pela altura para cobrir 1080×1920, corta centro, desfocha
-                `[bg_src]scale=-2:1920,crop=1080:1920:(iw-1080)/2:0,boxblur=20:20[bg]`,
+                `[bg_src]scale=-2:1920,crop=1080:1920:(iw-1080)/2:0,boxblur=20:20,setsar=1/1[bg]`,
                 // Frente: 1080px de largura, proporção original preservada
-                `[fg_src]scale=1080:-2[fg]`,
+                `[fg_src]scale=1080:-2,setsar=1/1[fg]`,
                 // Centraliza a camada principal sobre o fundo desfocado → 1080×1920
-                `[bg][fg]overlay=(W-w)/2:(H-h)/2[outv]`,
+                `[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1/1,trim=duration=${duration},setpts=PTS-STARTPTS[outv]`,
                 // Áudio: resync + loudnorm + fade-out suave
                 audioChain,
             ].join(';');
         } else {
             // ── Modo: Split-Screen (dois painéis 1080×960 empilhados) ─────────
-            // Útil para conteúdo com facecam separada (câmera + gameplay).
+            // Facecam (topo): crop 9:8 centrado na posição do rosto → 1080×960
+            // Gameplay (fundo): crop 9:8 centralizado → 1080×960
+            // vstack → 1080×1920
+            const normalize =
+                `scale=1920:1080:force_original_aspect_ratio=increase:flags=lanczos,` +
+                `crop=1920:1080,setsar=1/1`;
+
             filterStr = [
-                // Vídeo: duplica em dois ramos
                 `[0:v]split=2[v1][v2]`,
-                // Facecam (painel superior): crop 9:8 centrado no rosto + borda 4px
-                `[v1]crop=ih*9/8:ih:(iw-ih*9/8)*${safeX}:0,` +
-                    `scale=1080:960:flags=lanczos,` +
+                `[v1]${normalize},` +
+                    `crop=ih*9/8:ih:(iw-ih*9/8)*${safeX}:0,` +
+                    `scale=1080:960:flags=lanczos,setsar=1/1,` +
                     `drawbox=x=0:y=956:w=iw:h=4:color=black:t=fill[top]`,
-                // Gameplay (painel inferior): crop 9:8 centralizado
-                `[v2]crop=ih*9/8:ih:(iw-ih*9/8)*0.5:0,scale=1080:960:flags=lanczos[bot]`,
-                // Stack vertical → 1080×1920
-                `[top][bot]vstack=inputs=2[outv]`,
-                // Áudio: resync + loudnorm + fade-out suave
+                `[v2]${normalize},` +
+                    `crop=ih*9/8:ih:(iw-ih*9/8)*0.5:0,` +
+                    `scale=1080:960:flags=lanczos,setsar=1/1[bot]`,
+                `[top][bot]vstack=inputs=2,trim=duration=${duration},setpts=PTS-STARTPTS[outv]`,
                 audioChain,
             ].join(';');
         }
@@ -318,6 +449,10 @@ function runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, output
             .audioCodec('aac')
             .audioBitrate('192k')
             .outputOptions([
+                // Força 8-bit: sem isso, fonte 10-bit (comum em VODs/lives) vira
+                // High 10 profile, que a maioria dos players (Windows, navegadores)
+                // não decodifica — "não é possível abrir o vídeo".
+                '-pix_fmt yuv420p',
                 '-crf 18',
                 '-b:v 5M',
                 '-maxrate 5M',
@@ -397,6 +532,10 @@ function runFfmpegEncode(inputPath, outputPath, cropFilter, useComplex = false, 
             .audioCodec('aac')
             .audioBitrate('192k')
             .outputOptions([
+                // Força 8-bit: sem isso, fonte 10-bit (comum em VODs/lives) vira
+                // High 10 profile, que a maioria dos players (Windows, navegadores)
+                // não decodifica — "não é possível abrir o vídeo".
+                '-pix_fmt yuv420p',
                 '-crf 18',          // Alta qualidade (era 23 — menos é melhor)
                 '-b:v 5M',          // 5 Mbps — bitrate adequado para Shorts/TikTok HD
                 '-preset fast',
@@ -555,6 +694,10 @@ export function runFfmpegSplitScreen(podcastPath, gameplayPath, outputPath, dura
             .audioCodec('aac')
             .audioBitrate('192k')
             .outputOptions([
+                // Força 8-bit: sem isso, fonte 10-bit (comum em VODs/lives) vira
+                // High 10 profile, que a maioria dos players (Windows, navegadores)
+                // não decodifica — "não é possível abrir o vídeo".
+                '-pix_fmt yuv420p',
                 '-crf 18',
                 '-b:v 5M',
                 '-maxrate 5M',
@@ -588,7 +731,7 @@ function buildDynamicCropFilter(cmdsPath, meta) {
     return (
         `sendcmd=f='${escapedPath}',` +
         `crop=${meta.crop_w}:${meta.crop_h}:0:0,` +
-        `scale=1080:1920:flags=lanczos`
+        `scale=1080:1920:flags=lanczos,setsar=1/1`
     );
 }
 
@@ -598,7 +741,7 @@ function buildDynamicCropFilter(cmdsPath, meta) {
  */
 function buildStaticCropFilter(cropXPercent) {
     const safeX = Math.min(1, Math.max(0, cropXPercent));
-    return `crop=ih*9/16:ih:(iw-ih*9/16)*${safeX}:0,scale=1080:1920:flags=lanczos`;
+    return `crop=ih*9/16:ih:(iw-ih*9/16)*${safeX}:0,scale=1080:1920:flags=lanczos,setsar=1/1`;
 }
 
 /**
@@ -621,14 +764,18 @@ function buildStaticCropFilter(cropXPercent) {
  */
 function buildSplitScreenFilter(cropXPercent) {
     const safeX = Math.min(1, Math.max(0, cropXPercent));
+    const normalize =
+        `scale=1920:1080:force_original_aspect_ratio=increase:flags=lanczos,` +
+        `crop=1920:1080,setsar=1/1`;
     return [
-        // Duplica o stream de vídeo em dois ramos
         `[0:v]split=2[a][b]`,
-        // Face cam (painel superior): crop no rosto → scale 1080×960 → linha divisória preta 4px
-        `[a]crop=ih*9/8:ih:(iw-ih*9/8)*${safeX}:0,scale=1080:960:flags=lanczos,drawbox=x=0:y=956:w=iw:h=4:color=black:t=fill[top]`,
-        // Gameplay (painel inferior): crop centralizado → scale 1080×960
-        `[b]crop=ih*9/8:ih:(iw-ih*9/8)*0.5:0,scale=1080:960:flags=lanczos[bot]`,
-        // Empilha verticalmente → frame final 1080×1920
+        `[a]${normalize},` +
+            `crop=ih*9/8:ih:(iw-ih*9/8)*${safeX}:0,` +
+            `scale=1080:960:flags=lanczos,setsar=1/1,` +
+            `drawbox=x=0:y=956:w=iw:h=4:color=black:t=fill[top]`,
+        `[b]${normalize},` +
+            `crop=ih*9/8:ih:(iw-ih*9/8)*0.5:0,` +
+            `scale=1080:960:flags=lanczos,setsar=1/1[bot]`,
         `[top][bot]vstack=inputs=2[out]`,
     ].join(';');
 }
@@ -662,11 +809,11 @@ function buildBlurredBackgroundFilter() {
         // Duplica o stream em dois ramos independentes
         '[0:v]split=2[bg_src][fg_src]',
         // Fundo: preenche 1080×1920 e aplica desfoque pesado
-        '[bg_src]scale=-2:1920,crop=1080:1920:(iw-1080)/2:0,boxblur=20:20[bg]',
+        '[bg_src]scale=-2:1920,crop=1080:1920:(iw-1080)/2:0,boxblur=20:20,setsar=1/1[bg]',
         // Frente: 1080px de largura mantendo proporção original (sem distorção)
-        '[fg_src]scale=1080:-2[fg]',
+        '[fg_src]scale=1080:-2,setsar=1/1[fg]',
         // Sobrepõe a camada principal centralizada sobre o fundo desfocado
-        '[bg][fg]overlay=(W-w)/2:(H-h)/2[out]',
+        '[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1/1[out]',
     ].join(';');
 }
 
@@ -688,7 +835,7 @@ function buildBlurredBackgroundFilter() {
  * @returns {Promise<string>} caminho absoluto do arquivo salvo
  */
 export async function processClip(peakData, clipIndex = 1, totalClips = 1) {
-    const { videoUrl, peakTime, title, duration: vodDuration, outputBaseDir: overrideOutputDir } = peakData;
+    const { videoUrl, peakTime, title, duration: vodDuration, outputBaseDir: overrideOutputDir, skipCaptions = false, layout: personaLayout = null, niche = 'default' } = peakData;
     const bufferSeconds = parseInt(process.env.CLIP_BUFFER_SECONDS || '30', 10);
     const maxDuration = parseInt(process.env.CLIP_DURATION_MAX || '35', 10);
     const baseOutputDir = path.resolve(overrideOutputDir || process.env.OUTPUT_DIR || './output');
@@ -702,16 +849,11 @@ export async function processClip(peakData, clipIndex = 1, totalClips = 1) {
         ? Math.min(vodDuration, peakTime + bufferSeconds)
         : peakTime + bufferSeconds;
     // Limita a duração máxima para manter clipes no intervalo ideal (15–35s para Shorts/TikTok)
-    const endTime = Math.min(rawEndTime, startTime + maxDuration);
-    const clipDurationSec = endTime - startTime;
+    let endTime = Math.min(rawEndTime, startTime + maxDuration);
 
-    logger.info(
-        `Clip ${clipIndex}/${totalClips} — Intervalo: ${formatDuration(startTime)} → ${formatDuration(endTime)} ` +
-        `(buffer de ${bufferSeconds}s antes e depois)`
-    );
-
-    ensureOutputDir(outputDir);
-
+    // Filename/outputPath só dependem de peakTime, não do endTime final — checa
+    // cache ANTES de resolver stream/transcrever, pra não gastar API à toa
+    // num clipe que já existe.
     const filename = buildOutputFilename(peakTime, clipIndex, totalClips);
     const outputPath = path.join(outputDir, filename);
 
@@ -720,19 +862,75 @@ export async function processClip(peakData, clipIndex = 1, totalClips = 1) {
         return outputPath;
     }
 
+    // Precisa das URLs de stream já aqui (antes do endTime final) pro
+    // smart-boundary poder transcrever a janela de áudio e ajustar onde o
+    // clipe termina antes de decidir a duração definitiva.
     const { videoStreamUrl, audioStreamUrl } = await getStreamUrls(videoUrl);
 
-    // Split-screen desativado por padrão — ativar com SPLIT_SCREEN=true no .env
-    const useSplitScreen = process.env.SPLIT_SCREEN === 'true';
-    // Fundo desfocado: preserva frame 16:9 completo sem cortar laterais.
-    // Tem precedência sobre split-screen quando ativo.
-    // Ativar com BLUR_BACKGROUND=true no .env
-    const useBlurBackground = process.env.BLUR_BACKGROUND === 'true';
+    // Ajusta o fim do clipe pra cair no fechamento natural do assunto (ex.:
+    // uma oração que termina com "amém"), em vez de cortar num instante fixo
+    // que pode interromper o que está sendo dito. Fallback silencioso: se
+    // falhar, endTime permanece o original.
+    endTime = await findSmartEndTime({
+        audioStreamUrl: audioStreamUrl || videoStreamUrl,
+        startTime,
+        targetEndTime: endTime,
+        hardMaxEndTime: vodDuration ? Math.min(vodDuration, startTime + maxDuration + 60) : startTime + maxDuration + 60,
+    });
+
+    const clipDurationSec = endTime - startTime;
+
+    // Guarda de qualidade: pico na borda do vídeo gera clipe truncado.
+    // (Os picos de heatmap já são filtrados na seleção — isto cobre os demais
+    // caminhos: chat replay da Twitch, radar, live monitor, etc.)
+    const minClipSec = parseInt(process.env.CLIP_DURATION_MIN || '11', 10);
+    if (clipDurationSec < minClipSec) {
+        throw new Error(
+            `Clipe muito curto (${clipDurationSec.toFixed(1)}s < ${minClipSec}s) — pico a ${peakTime.toFixed(0)}s, na borda do vídeo.`
+        );
+    }
+
+    logger.info(
+        `Clip ${clipIndex}/${totalClips} — Intervalo: ${formatDuration(startTime)} → ${formatDuration(endTime)} ` +
+        `(buffer de ${bufferSeconds}s antes e depois)`
+    );
+
+    ensureOutputDir(outputDir);
+
+    // ── Layout do clipe ───────────────────────────────────────────────────────
+    // Prioridade: campo `layout` da persona (personas.js) > variáveis do .env.
+    // Modos: 'hybrid' (gameplay 16:9 no topo + área de design),
+    //        'blur'   (frame 16:9 completo centralizado sobre fundo desfocado),
+    //        'split'  (facecam em cima + gameplay embaixo),
+    //        'asd'    (crop 9:16 dinâmico seguindo quem fala — padrão).
+    const envLayout = process.env.BLUR_BACKGROUND === 'true' ? 'blur'
+        : process.env.SPLIT_SCREEN === 'true' ? 'split'
+        : 'asd';
+    let layout = personaLayout || envLayout;
+
+    // 'auto': decide pelo conteúdo do quadro (webcam grande → asd; jogo em
+    // tela cheia → hybrid). O mesmo canal alterna os dois tipos de cena, então
+    // fixar o formato por persona erra metade dos clipes.
+    if (layout === 'auto') {
+        logger.step('[Layout] Modo automático — classificando a cena...');
+        try {
+            layout = await detectSceneLayout(videoStreamUrl, startTime, endTime);
+        } catch (err) {
+            logger.warn(`[Layout] Detecção falhou (${err.message}) — usando "asd".`);
+            layout = 'asd';
+        }
+    } else if (personaLayout) {
+        logger.info(`[Layout] Modo "${layout}" definido pela persona.`);
+    }
+
+    const useSplitScreen = layout === 'split';
+    const useBlurBackground = layout === 'blur';
+    const useHybrid = layout === 'hybrid';
 
     // ── Caminho ASD: download local → MediaPipe → crop dinâmico single-panel ──
     // Só é necessário quando ASD está ativo, split-screen desabilitado E blur
     // desabilitado, pois ASD gera sendcmd para crop frame-a-frame.
-    if (useAsd && !useSplitScreen && !useBlurBackground) {
+    if (useAsd && !useSplitScreen && !useBlurBackground && !useHybrid) {
         const tempRaw  = path.join(os.tmpdir(), `asd-raw-${Date.now()}.mp4`);
         const tempCmds = path.join(os.tmpdir(), `asd-cmds-${Date.now()}.txt`);
         try {
@@ -743,7 +941,11 @@ export async function processClip(peakData, clipIndex = 1, totalClips = 1) {
                 logger.info('[ASD] Crop dinâmico MediaPipe aplicado (single-panel).');
                 const cropFilter = buildDynamicCropFilter(tempCmds, meta);
                 await runFfmpegEncode(tempRaw, outputPath, cropFilter, false, clipDurationSec);
-                await addCaptionsToClip(outputPath);
+                await discardIfTooShort(outputPath, minClipSec);
+                if (discardIfDuplicate(outputPath)) {
+                    throw new Error('Clipe idêntico a outro já gerado desta fonte — descartado.');
+                }
+                if (!skipCaptions) await addCaptionsToClip(outputPath, { niche, layout });
                 logger.success(`Clipe ${clipIndex}/${totalClips} salvo: ${filename}`);
                 return outputPath;
             }
@@ -756,21 +958,25 @@ export async function processClip(peakData, clipIndex = 1, totalClips = 1) {
 
     // ── Caminho principal: direto do CDN sem arquivo temporário ───────────────
     // Blur background: face detection desnecessária (frame completo preservado).
-    // Split-screen: detecta posição do rosto para o crop do painel superior.
-    const cropX = (!useBlurBackground && useSplitScreen)
+    // Split-screen: detecta posição horizontal do rosto para o crop do painel superior.
+    const cropX = useSplitScreen
         ? await detectCropXPosition(videoStreamUrl, startTime, endTime)
         : 0.5;
 
-    if (useBlurBackground) {
+    if (useHybrid) {
+        // ── Modo: Híbrido (gameplay 16:9 no topo + área de design) ────────────
+        logger.info('[Hybrid] Painel 16:9 nativo no topo + área de legendas — sem upscale.');
+        await runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, outputPath, 0.5, 'hybrid');
+    } else if (useBlurBackground) {
         // ── Modo: Fundo Desfocado ─────────────────────────────────────────────
         // Frame 16:9 original preservado na íntegra. Barras laterais/superiores
         // preenchidas com a própria imagem desfocada — sem crop agressivo.
         logger.info('[Blur-BG] Fundo desfocado 1080×1920 — frame original sem cortes...');
-        await runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, outputPath, 0.5, true);
+        await runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, outputPath, 0.5, 'blur');
     } else if (useSplitScreen) {
         // ── Modo: Split-Screen ────────────────────────────────────────────────
         logger.info(`[Split-Screen] Rosto em X=${(cropX * 100).toFixed(0)}% — cortando direto do CDN...`);
-        await runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, outputPath, cropX, false);
+        await runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, outputPath, cropX, 'split');
     } else {
         // ── Modo: Crop Estático ───────────────────────────────────────────────
         logger.info('[Static] Crop 9:16 centralizado.');
@@ -783,10 +989,188 @@ export async function processClip(peakData, clipIndex = 1, totalClips = 1) {
         }
     }
 
-    // Adiciona legendas automáticas (se ADD_CAPTIONS=true no .env)
-    await addCaptionsToClip(outputPath);
+    // Confere a duração REAL do arquivo. O guard lá em cima valida o intervalo
+    // PEDIDO; se o FFmpeg truncar a saída (stream instável, erro de rede), o
+    // arquivo sai com 1–2s e passaria batido para a fila.
+    await discardIfTooShort(outputPath, minClipSec);
+
+    // Última barreira contra clipes gêmeos: se este arquivo ficou idêntico a
+    // outro já gerado na mesma pasta, descarta agora — antes das legendas e
+    // antes de entrar na fila do poster.
+    if (discardIfDuplicate(outputPath)) {
+        throw new Error('Clipe idêntico a outro já gerado desta fonte — descartado.');
+    }
+
+    // Adiciona legendas automáticas (se ADD_CAPTIONS=true no .env).
+    // skipCaptions: fontes que já têm legenda queimada (ex.: cortes de
+    // concorrentes via Trend Hunter) não recebem uma segunda camada.
+    if (!skipCaptions) await addCaptionsToClip(outputPath, { niche, layout });
 
     logger.success(`Clipe ${clipIndex}/${totalClips} salvo: ${filename}`);
+    return outputPath;
+}
+
+/**
+ * Apaga e rejeita o clipe se a duração REAL do arquivo ficar abaixo do mínimo.
+ */
+async function discardIfTooShort(outputPath, minClipSec) {
+    const real = await probeVideoDuration(outputPath).catch(() => null);
+    if (real !== null && real < minClipSec) {
+        try { fs.unlinkSync(outputPath); } catch { /* ignora */ }
+        throw new Error(`Arquivo gerado ficou com ${real.toFixed(1)}s (mínimo ${minClipSec}s) — descartado.`);
+    }
+}
+
+/**
+ * Compara o clipe recém-gerado com os demais .mp4 da mesma pasta (tamanho
+ * exato + hash de amostras). Se for duplicata, apaga e retorna true.
+ */
+function discardIfDuplicate(outputPath) {
+    try {
+        const dir = path.dirname(outputPath);
+        const size = fs.statSync(outputPath).size;
+        const twins = fs.readdirSync(dir)
+            .filter((f) => f.toLowerCase().endsWith('.mp4') && path.join(dir, f) !== outputPath)
+            .map((f) => path.join(dir, f))
+            .filter((f) => { try { return fs.statSync(f).size === size; } catch { return false; } });
+
+        if (twins.length === 0) return false;
+
+        const h = sampleHash(outputPath);
+        for (const twin of twins) {
+            if (sampleHash(twin) === h) {
+                logger.warn(`[FFmpeg] Clipe idêntico a "${path.basename(twin)}" — descartando ${path.basename(outputPath)}.`);
+                try { fs.unlinkSync(outputPath); } catch { /* ignora */ }
+                return true;
+            }
+        }
+        return false;
+    } catch (err) {
+        logger.warn(`[FFmpeg] Checagem de duplicata falhou: ${err.message} — mantendo o clipe.`);
+        return false;
+    }
+}
+
+function sampleHash(filePath) {
+    const size = fs.statSync(filePath).size;
+    const hash = crypto.createHash('sha1').update(String(size));
+    const SAMPLE = 1024 * 1024;
+    const fd = fs.openSync(filePath, 'r');
+    try {
+        const buf = Buffer.alloc(SAMPLE);
+        for (const off of [0, Math.max(0, Math.floor(size / 2)), Math.max(0, size - SAMPLE)]) {
+            const read = fs.readSync(fd, buf, 0, Math.min(SAMPLE, size - off), off);
+            if (read > 0) hash.update(buf.subarray(0, read));
+        }
+    } finally {
+        fs.closeSync(fd);
+    }
+    return hash.digest('hex');
+}
+
+// ─── Probe de duração via ffprobe ─────────────────────────────────────────────
+
+export async function probeVideoDuration(filePath, retries = 3) {
+    const ffprobePath = process.env.FFPROBE_PATH?.trim() || 'ffprobe';
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const { stdout } = await execFileAsync(ffprobePath, [
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'json',
+                filePath,
+            ]);
+            const duration = parseFloat(JSON.parse(stdout).format?.duration) || null;
+            if (duration !== null) return duration;
+        } catch { /* tenta de novo abaixo */ }
+
+        // Arquivos grandes (ex: compilações de vários lances) às vezes ainda não
+        // terminaram de ser sincronizados no disco no instante em que o processo
+        // do FFmpeg sinaliza "end" — um ffprobe imediato pode ler um arquivo
+        // incompleto. Retry com pequeno atraso resolve sem mascarar falha real.
+        if (attempt < retries) await new Promise((r) => setTimeout(r, 500 * attempt));
+    }
+    return null;
+}
+
+// ─── Utilitários locais para o Sports VOD Miner (trim + concat sem re-encode) ──
+//
+// Usados para derivar o clipe curto (Short) a partir do clipe largo já baixado
+// (sem nova chamada ao yt-dlp) e para montar a compilação "vídeo longo" com
+// vários lances do mesmo VOD. Ambos usam stream-copy (-c copy) — rápido e sem
+// perda de qualidade, já que o re-encode "de verdade" acontece depois em
+// processLocalClip (blur pad + legendas).
+
+/**
+ * Corta um trecho de um arquivo já local via stream-copy.
+ * @param {string} inputPath
+ * @param {number} startSec  - offset dentro do PRÓPRIO arquivo (não do vídeo original)
+ * @param {number} durationSec
+ * @param {string} outputPath
+ */
+export function trimLocalFile(inputPath, startSec, durationSec, outputPath) {
+    return new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .inputOptions([`-ss ${Math.max(0, startSec)}`])
+            .outputOptions([`-t ${durationSec}`, '-c copy', '-avoid_negative_ts make_zero', '-y'])
+            .output(outputPath)
+            .on('end', () => resolve(outputPath))
+            .on('error', (err) => reject(new Error(`FFmpeg (trim local): ${err.message}`)))
+            .run();
+    });
+}
+
+/**
+ * Concatena múltiplos arquivos locais (mesma fonte/codec) em um único vídeo.
+ * @param {string[]} filePaths - ordem cronológica
+ * @param {string} outputPath
+ */
+export function concatLocalClips(filePaths, outputPath) {
+    const listFile = path.join(os.tmpdir(), `concat-${Date.now()}.txt`);
+    const listContent = filePaths
+        .map((f) => `file '${path.resolve(f).replace(/'/g, "'\\''")}'`)
+        .join('\n');
+    fs.writeFileSync(listFile, listContent, 'utf8');
+
+    return new Promise((resolve, reject) => {
+        const cleanup = () => { try { fs.unlinkSync(listFile); } catch { /* ignora */ } };
+        ffmpeg()
+            .input(listFile)
+            .inputOptions(['-f concat', '-safe 0'])
+            .outputOptions(['-c copy', '-y'])
+            .output(outputPath)
+            .on('end', () => { cleanup(); resolve(outputPath); })
+            .on('error', (err) => { cleanup(); reject(new Error(`FFmpeg (concat local): ${err.message}`)); })
+            .run();
+    });
+}
+
+// ─── Pipeline para arquivo local (Sports Radar) ───────────────────────────────
+
+/**
+ * Processa um arquivo de vídeo LOCAL para 9:16 com fundo desfocado.
+ * Usado pelo Sports Radar após captura DVR — nunca chama yt-dlp nem ASD.
+ * Sempre aplica blur background e pula detecção de rosto.
+ *
+ * @param {string} inputPath     - Caminho absoluto do arquivo bruto capturado via DVR
+ * @param {string} outputBaseDir - Diretório base onde a subpasta será criada
+ * @param {string} [title]       - Nome usado na subpasta e no arquivo de saída
+ * @returns {Promise<string>}    - Caminho absoluto do arquivo 9:16 processado
+ */
+export async function processLocalClip(inputPath, outputBaseDir, title = 'clip') {
+    const outputDir = path.join(path.resolve(outputBaseDir), sanitizeFilename(title));
+    ensureOutputDir(outputDir);
+
+    const outputPath = path.join(outputDir, `${sanitizeFilename(title)}-${Date.now()}.mp4`);
+    const duration = await probeVideoDuration(inputPath);
+
+    logger.info(`[FFmpeg/Local] Convertendo para 9:16 blur: ${path.basename(inputPath)}`);
+
+    const blurFilter = buildBlurredBackgroundFilter();
+    await runFfmpegEncode(inputPath, outputPath, blurFilter, true, duration);
+    await addCaptionsToClip(outputPath, { niche: 'default', layout: 'blur' });
+
+    logger.success(`[FFmpeg/Local] Pronto: ${path.basename(outputPath)}`);
     return outputPath;
 }
 

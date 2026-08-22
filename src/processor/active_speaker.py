@@ -17,7 +17,10 @@ Saída:
     <output_cmds.txt>.json  — metadados (crop_w, crop_h, vid_w, vid_h)
 
 Requer:
-    pip install mediapipe opencv-python numpy
+    pip install "mediapipe==0.10.14" opencv-python numpy
+    (mediapipe >= 1.0 removeu a API legada `mp.solutions` usada aqui — não
+    instalar sem pinar a versão, ou o script volta a falhar com
+    "AttributeError: module 'mediapipe' has no attribute 'solutions'")
 """
 
 import sys

@@ -130,7 +130,7 @@ async function captureFromLive(persona, streamInfo) {
         let generated = 0;
         for (let i = 0; i < peaks.length; i++) {
             try {
-                await processClip({ ...peaks[i], videoUrl: filePath }, i + 1, peaks.length);
+                await processClip({ ...peaks[i], videoUrl: filePath, layout: persona.layout ?? null, niche: persona.niche ?? 'default' }, i + 1, peaks.length);
                 generated++;
             } catch (err) {
                 logger.error(`[LiveCapture] Clipe ${i + 1} falhou: ${err.message}`);

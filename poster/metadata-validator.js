@@ -16,9 +16,11 @@ const HISTORY_FILE = path.resolve('./postados/metadata-history.json');
 
 function loadHistory() {
     try {
-        return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+        const h = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+        if (!h.hashtagsByNiche) h.hashtagsByNiche = {}; // compat com histórico antigo
+        return h;
     } catch {
-        return { titles: [], hashtags: [], descriptions: [] };
+        return { titles: [], hashtags: [], descriptions: [], hashtagsByNiche: {} };
     }
 }
 
@@ -27,7 +29,14 @@ function saveHistory(history) {
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
 }
 
-export function recordMetadataHistory(titulo, hashtags) {
+/**
+ * @param {string} titulo
+ * @param {string} hashtags
+ * @param {string} [niche] - usado pra rastrear hashtags recentes POR NICHO
+ *   (ver getRecentHashtagsForNiche) — a lista `hashtags` global continua
+ *   existindo separadamente pra detecção de duplicata no post individual.
+ */
+export function recordMetadataHistory(titulo, hashtags, niche = 'default') {
     const history = loadHistory();
     if (!history.titles.includes(titulo)) history.titles.push(titulo);
     const tags = hashtags.split(/\s+/).filter(Boolean).map((t) => t.toLowerCase());
@@ -36,7 +45,29 @@ export function recordMetadataHistory(titulo, hashtags) {
     }
     history.titles = history.titles.slice(-500);
     history.hashtags = history.hashtags.slice(-1000);
+
+    // Histórico recente POR NICHO — ordem de inserção preservada (mais
+    // recente por último), usado pra instruir a IA a não repetir na próxima
+    // geração do mesmo nicho (ver poster/metadata.js buildCopyPrompt).
+    if (!history.hashtagsByNiche[niche]) history.hashtagsByNiche[niche] = [];
+    history.hashtagsByNiche[niche].push(...tags);
+    history.hashtagsByNiche[niche] = history.hashtagsByNiche[niche].slice(-40);
+
     saveHistory(history);
+}
+
+/**
+ * Últimas N hashtags usadas por este nicho especificamente (mais recente
+ * primeiro) — pra injetar no prompt de geração e evitar convergência nas
+ * mesmas 1-2 tags óbvias do nicho toda vez.
+ * @param {string} niche
+ * @param {number} [limit]
+ * @returns {string[]}
+ */
+export function getRecentHashtagsForNiche(niche, limit = 15) {
+    const history = loadHistory();
+    const list = history.hashtagsByNiche?.[niche] ?? [];
+    return list.slice(-limit).reverse();
 }
 
 // ─── Diretrizes do YouTube ────────────────────────────────────────────────────
@@ -57,7 +88,11 @@ const YT_RULES = {
         ],
         maxHashtagsInTitle: 5,
         maxEmojis: 2,
-        maxCaps: 0.4,
+        // 0.4 gerava aviso quase sempre (2 palavras em CAIXA ALTA num título
+        // curto já ultrapassa 40% de letras maiúsculas). O prompt agora limita
+        // a IA a 2-3 palavras-chave em caixa alta (não a frase toda) — 0.55
+        // deixa passar isso e ainda reprova título 100% em caixa alta.
+        maxCaps: 0.55,
         hookPatterns: [
             /[?!…]/,
             /\b(admitiu|revelou|confessou|errou|perdeu|ganhou|explodiu|chorou|discutiu|reagiu)\b/i,
@@ -95,7 +130,7 @@ const TIKTOK_RULES = {
 
 // ─── Validação Principal ──────────────────────────────────────────────────────
 
-export function validateMetadata(metadata) {
+export function validateMetadata(metadata, { isLongVideo = false, isGenerated = false } = {}) {
     const errors = [];
     const warnings = [];
     let score = 100;
@@ -123,8 +158,15 @@ export function validateMetadata(metadata) {
     }
 
     // ── TÍTULO ────────────────────────────────────────────────────────────────
-    if (titulo.length < YT_RULES.titulo.minLen) {
-        errors.push(`Título muito curto (${titulo.length} chars, mín ${YT_RULES.titulo.minLen})`);
+    // Vídeos GERADOS (Canal da Fé, Canal Infantil) trazem título próprio do
+    // roteirista, curto por natureza (ex.: "🌟 Sonhos Mágicos! 🌟"). O mínimo de
+    // 20 chars foi pensado para os cortes, cujo título é escrito pelo copywriter
+    // viral; aplicá-lo aos gerados reprovava metadado perfeitamente válido.
+    const minTitulo = isGenerated
+        ? parseInt(process.env.MIN_TITLE_LEN_GERADO || '10', 10)
+        : YT_RULES.titulo.minLen;
+    if (titulo.length < minTitulo) {
+        errors.push(`Título muito curto (${titulo.length} chars, mín ${minTitulo})`);
         score -= 30;
     }
 
@@ -200,10 +242,14 @@ export function validateMetadata(metadata) {
         score -= 5;
     }
 
-    const hasShorts = tagList.some((t) => t.toLowerCase() === '#shorts');
-    if (!hasShorts) {
-        errors.push('Hashtag #shorts ausente');
-        score -= 30;
+    // #shorts só é exigido para o formato vertical curto — vídeos longos (>30s,
+    // publicados como vídeo normal do YouTube) não devem levar essa hashtag.
+    if (!isLongVideo) {
+        const hasShorts = tagList.some((t) => t.toLowerCase() === '#shorts');
+        if (!hasShorts) {
+            errors.push('Hashtag #shorts ausente');
+            score -= 30;
+        }
     }
 
     for (const tag of tagList) {
@@ -257,7 +303,7 @@ export function validateMetadata(metadata) {
 
 // ─── Auto-sanitização ────────────────────────────────────────────────────────
 
-export function sanitizeMetadata(metadata) {
+export function sanitizeMetadata(metadata, { isLongVideo = false } = {}) {
     let { titulo, descricao, hashtags } = metadata;
 
     // Sanitiza conteúdo ofensivo PRIMEIRO
@@ -279,7 +325,7 @@ export function sanitizeMetadata(metadata) {
     }
 
     const tagList = hashtags.split(/\s+/).filter((t) => t.startsWith('#'));
-    if (!tagList.some((t) => t.toLowerCase() === '#shorts')) {
+    if (!isLongVideo && !tagList.some((t) => t.toLowerCase() === '#shorts')) {
         tagList.unshift('#shorts');
     }
     const uniqueTags = [...new Set(tagList.map((t) => t.toLowerCase()))];
@@ -301,8 +347,8 @@ export function sanitizeMetadata(metadata) {
 
 // ─── Validação com log formatado ─────────────────────────────────────────────
 
-export function validateAndLog(metadata) {
-    const result = validateMetadata(metadata);
+export function validateAndLog(metadata, { isLongVideo = false, isGenerated = false } = {}) {
+    const result = validateMetadata(metadata, { isLongVideo, isGenerated });
 
     const icon = result.score >= 80 ? '✅' : result.score >= 50 ? '⚠️' : '❌';
     logger.info(`[Validator] ${icon} Score: ${result.score}/100`);
@@ -314,7 +360,7 @@ export function validateAndLog(metadata) {
         logger.warn(`[Validator] ⚠️  ${warn}`);
     }
 
-    const sanitized = sanitizeMetadata(metadata);
+    const sanitized = sanitizeMetadata(metadata, { isLongVideo });
 
     return { ...sanitized, _validation: result };
 }

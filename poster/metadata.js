@@ -16,7 +16,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import Groq from 'groq-sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { logger } from './logger.js';
-import { validateAndLog } from './metadata-validator.js';
+import { validateAndLog, getRecentHashtagsForNiche } from './metadata-validator.js';
 import { sanitizeTranscript, sanitizeMetadataText } from './content-filter.js';
 import { getPersonaBranding } from './branding.js';
 import { PERSONAS_MAP } from '../src/capturer/personas.js';
@@ -50,6 +50,20 @@ const VIRAL_FORMULAS = {
         'POLÊMICA: "[ATLETA] FALA A VERDADE SOBRE [SUPLEMENTO/DIETA]"',
         'DESAFIO: "[ATLETA] TENTOU [DESAFIO] E O RESULTADO FOI..."',
     ],
+    religioso: [
+        'PALAVRA FORTE: "A MENSAGEM QUE VAI MUDAR SEU DIA"',
+        'ORAÇÃO: "FAÇA ESTA ORAÇÃO E ENTREGUE [SITUAÇÃO] A DEUS"',
+        'REFLEXÃO: "[PREGADOR] EXPLICA O QUE [PASSAGEM/TEMA] SIGNIFICA"',
+        'TESTEMUNHO: "VOCÊ PRECISA OUVIR ISSO HOJE"',
+        'FÉ: "DEUS TEM UMA PALAVRA PARA QUEM ESTÁ [SITUAÇÃO]"',
+    ],
+    infantil: [
+        'CURIOSIDADE DIVERTIDA: "VOCÊ SABIA QUE [FATO CURIOSO]? 😲"',
+        'DESCOBERTA: "[PERSONAGEM] DESCOBRIU [COISA INCRÍVEL]!"',
+        'DESAFIO KIDS: "[PERSONAGEM] TOPOU O DESAFIO DE [DESAFIO]"',
+        'SURPRESA: "OLHA O QUE ACONTECEU QUANDO [SITUAÇÃO]!"',
+        'APRENDA BRINCANDO: "A FORMA MAIS DIVERTIDA DE APRENDER [TEMA]"',
+    ],
     default: [
         'CURIOSIDADE: "VOCÊ SABIA QUE [FATO DO VÍDEO]?"',
         'IMPACTO: "A CENA QUE CHOCOU A TODOS NA LIVE"',
@@ -59,14 +73,33 @@ const VIRAL_FORMULAS = {
 
 // ─── PROMPT DO COPYWRITER VIRAL ───────────────────────────────────────────────
 
-function buildCopyPrompt(niche, formulas) {
-    return `Copywriter de YouTube Shorts/TikTok. Gere metadados em JSON puro.
+function buildCopyPrompt(niche, formulas, isLongVideo = false, recentHashtags = []) {
+    const hashtagRules = isLongVideo
+        ? `- 5 hashtags separadas por espaço relacionadas ao conteúdo do vídeo
+- NÃO inclua #shorts — este vídeo será publicado como vídeo normal do YouTube, não como Short
+- 1 de nicho amplo + 3 específicas do vídeo + 1 do criador`
+        : `- 5 hashtags separadas por espaço, #shorts primeiro
+- 1 de nicho amplo + 3 específicas do vídeo + 1 do criador`;
+    const hashtagExample = isLongVideo
+        ? '"hashtags":"#futebol #tag2 #tag3 #tag4 #tag5"'
+        : '"hashtags":"#shorts #tag2 #tag3 #tag4 #tag5"';
+
+    // Anti-repetição: sem isso a IA converge sempre nas mesmas 1-2 hashtags
+    // óbvias do nicho (ex.: sempre #gaming, sempre #fé) porque não tem
+    // memória entre chamadas. Injeta as usadas recentemente PARA ESTE NICHO
+    // e pede pra variar — não bloqueia reuso total (algumas tags amplas são
+    // inevitáveis), só empurra pra escolher sinônimos/variações.
+    const antiRepeticaoHashtags = recentHashtags.length > 0
+        ? `\nHASHTAGS JÁ USADAS RECENTEMENTE NESTE NICHO (evite repetir estas exatas — use sinônimos ou variações):\n${recentHashtags.join(' ')}\n`
+        : '';
+
+    return `Copywriter de YouTube${isLongVideo ? '' : ' Shorts'}/TikTok. Gere metadados em JSON puro.
 
 NICHO DO CANAL: ${niche}
 
 FÓRMULAS DE TÍTULO (escolha UMA e adapte ao conteúdo real da transcrição):
 ${formulas}
-
+${antiRepeticaoHashtags}
 EXEMPLOS DE TÍTULOS DE SUCESSO (inspire-se no padrão, NÃO copie):
 - "SATANISMO É UM CAMINHO SEM VOLTA? | Cortes do Flow"
 - "MARINHO COMPROU A LOJA TODA EM DINHEIRO | Cortes do Flow"
@@ -82,7 +115,9 @@ REGRAS INVIOLÁVEIS:
 5. NÃO use: "você não vai acreditar", "incrível", "chocante", "imperdível", "clique aqui"
 
 TÍTULO (campo "titulo"):
-- 40-70 caracteres, use CAIXA ALTA em palavras-chave para impacto
+- 40-70 caracteres
+- CAIXA ALTA em NO MÁXIMO 2-3 palavras-chave de maior impacto — o resto da
+  frase em minúsculas normais (título 100% em caixa alta é reprovado)
 - Máx 2 emojis, sem hashtags no título
 - Deve ter gatilho: pergunta, revelação, humor, surpresa ou tensão
 
@@ -92,8 +127,7 @@ DESCRIÇÃO (campo "descricao"):
 - Máx 200 caracteres
 
 HASHTAGS (campo "hashtags"):
-- 5 hashtags separadas por espaço, #shorts primeiro
-- 1 de nicho amplo + 3 específicas do vídeo + 1 do criador
+${hashtagRules}
 - Sem acentos, máx 30 chars cada
 
 TEXTO DA THUMBNAIL (campo "thumbText"):
@@ -101,7 +135,7 @@ TEXTO DA THUMBNAIL (campo "thumbText"):
 - Ex: Se título é "ELE REVELOU O SEGREDO", thumbText pode ser "NINGUÉM ESPERAVA"
 
 Responda APENAS com JSON válido:
-{"titulo":"...","descricao":"...","hashtags":"#shorts #tag2 #tag3 #tag4 #tag5","thumbText":"..."}`;
+{"titulo":"...","descricao":"...",${hashtagExample},"thumbText":"..."}`;
 }
 
 // ─── 1. Extração de Áudio ─────────────────────────────────────────────────────
@@ -145,10 +179,28 @@ export async function transcribeAudio(audioPath) {
 
 // ─── 3. Detecta persona e nicho a partir do caminho do vídeo ─────────────────
 
+// Personas virtuais dos canais gerados por IA (Canal da Fé, Canal Infantil)
+// vivem em src/canal-da-fe/generate.js e src/canal-infantil/generate.js —
+// arquivos separados que nunca entram em PERSONAS_MAP (só personas.js entra).
+// Na prática elas trazem sidecar .meta.json e pulam generateMetadata inteiro
+// (ver poster/index.js), então isto só importa no caminho de fallback (sidecar
+// ausente/corrompido) — mas sem isso o niche caía sempre em 'default'.
+const NICHE_OVERRIDE_BY_FOLDER = {
+    canaldafe: 'religioso',
+    canalinfantil: 'infantil',
+};
+
 function getPersonaInfo(videoPath) {
     const parts = videoPath.replace(/\\/g, '/').split('/');
     const personaName = parts.find((dir) => PERSONAS_MAP[dir]);
-    if (!personaName) return { name: 'default', niche: 'default', branding: '' };
+
+    if (!personaName) {
+        const overrideFolder = parts.find((dir) => NICHE_OVERRIDE_BY_FOLDER[dir]);
+        if (overrideFolder) {
+            return { name: overrideFolder, niche: NICHE_OVERRIDE_BY_FOLDER[overrideFolder], branding: '' };
+        }
+        return { name: 'default', niche: 'default', branding: '' };
+    }
 
     const persona = PERSONAS_MAP[personaName];
     return {
@@ -160,7 +212,7 @@ function getPersonaInfo(videoPath) {
 
 // ─── 4. Geração de Copy com Gemini 2.5 Flash (primário) ──────────────────────
 
-async function generateCopyWithGemini(transcript, videoPath) {
+async function generateCopyWithGemini(transcript, videoPath, isLongVideo = false) {
     const apiKey = process.env.GEMINI_API_KEY?.trim();
     if (!apiKey) throw new Error('GEMINI_API_KEY não configurada');
 
@@ -168,7 +220,8 @@ async function generateCopyWithGemini(transcript, videoPath) {
     logger.info(`[Metadata] Gerando copy viral com Gemini 2.5 Flash (Nicho: ${niche}, Persona: ${name})`);
 
     const formulasForNiche = (VIRAL_FORMULAS[niche] || VIRAL_FORMULAS.default).map((f) => `- ${f}`).join('\n');
-    const prompt = buildCopyPrompt(niche, formulasForNiche);
+    const recentHashtags = getRecentHashtagsForNiche(niche);
+    const prompt = buildCopyPrompt(niche, formulasForNiche, isLongVideo, recentHashtags);
 
     const cleanTranscript = sanitizeTranscript(transcript);
     const trimmedTranscript = cleanTranscript.length > 800
@@ -212,7 +265,7 @@ async function generateCopyWithGemini(transcript, videoPath) {
 
 // ─── 4b. Fallback: Groq/Llama com prompt restritivo ──────────────────────────
 
-async function generateCopyWithGroq(transcript, videoPath) {
+async function generateCopyWithGroq(transcript, videoPath, isLongVideo = false) {
     const apiKey = process.env.GROQ_API_KEY?.trim();
     if (!apiKey) throw new Error('GROQ_API_KEY não configurada');
 
@@ -220,7 +273,8 @@ async function generateCopyWithGroq(transcript, videoPath) {
     logger.warn(`[Metadata] Fallback: gerando copy com Groq Llama 3.3 70B (Nicho: ${niche})`);
 
     const formulasForNiche = (VIRAL_FORMULAS[niche] || VIRAL_FORMULAS.default).map((f) => `- ${f}`).join('\n');
-    const prompt = buildCopyPrompt(niche, formulasForNiche);
+    const recentHashtags = getRecentHashtagsForNiche(niche);
+    const prompt = buildCopyPrompt(niche, formulasForNiche, isLongVideo, recentHashtags);
 
     const cleanTranscript = sanitizeTranscript(transcript);
     const trimmedTranscript = cleanTranscript.length > 500
@@ -229,8 +283,18 @@ async function generateCopyWithGroq(transcript, videoPath) {
 
     const groq = new Groq({ apiKey });
     const completion = await groq.chat.completions.create({
-        model: process.env.GROQ_COPY_MODEL || 'llama-3.3-70b-versatile',
-        max_tokens: 300,
+        model: process.env.GROQ_COPY_MODEL || 'openai/gpt-oss-120b',
+        // gpt-oss-120b gasta tokens de RACIOCÍNIO INTERNO antes do JSON de
+        // saída — com o prompt completo daqui, medido em ~980 tokens de
+        // reasoning por padrão, bem acima do max_tokens:300 antigo (cortava
+        // no meio e nunca gerava o JSON: erro "json_validate_failed" /
+        // failed_generation vazio, reproduzido e confirmado em produção —
+        // pulava Bispo/Canal da Fé e Canal Infantil sempre que o Gemini caía
+        // no fallback). reasoning_effort:'low' derruba isso pra ~150-250
+        // tokens sem perder qualidade (testado); max_tokens com folga por
+        // segurança.
+        reasoning_effort: 'low',
+        max_tokens: 600,
         temperature: 0.5,
         response_format: { type: 'json_object' },
         messages: [
@@ -261,21 +325,21 @@ async function generateCopyWithGroq(transcript, videoPath) {
 
 // ─── 5. Geração com validação e retry ────────────────────────────────────────
 
-export async function generateCopy(transcript, videoPath) {
+export async function generateCopy(transcript, videoPath, isLongVideo = false) {
     const hasGemini = !!process.env.GEMINI_API_KEY?.trim();
     if (hasGemini) {
         try {
-            return await generateCopyWithGemini(transcript, videoPath);
+            return await generateCopyWithGemini(transcript, videoPath, isLongVideo);
         } catch (err) {
             logger.warn(`[Metadata] Gemini falhou: ${err.message} — tentando Groq...`);
         }
     }
-    return await generateCopyWithGroq(transcript, videoPath);
+    return await generateCopyWithGroq(transcript, videoPath, isLongVideo);
 }
 
-async function generateCopyWithValidation(transcript, videoPath) {
-    let metadata = await generateCopy(transcript, videoPath);
-    let validated = validateAndLog(metadata);
+async function generateCopyWithValidation(transcript, videoPath, isLongVideo = false) {
+    let metadata = await generateCopy(transcript, videoPath, isLongVideo);
+    let validated = validateAndLog(metadata, { isLongVideo });
 
     if (!validated._validation.valid) {
         const criticalErrors = validated._validation.errors.filter(
@@ -285,8 +349,8 @@ async function generateCopyWithValidation(transcript, videoPath) {
             logger.warn('[Metadata] Regenerando por erros críticos...');
             const retryTranscript = `${transcript}\n\n[INSTRUÇÃO EXTRA: Título COMPLETAMENTE DIFERENTE e original. Erros: ${criticalErrors.join('; ')}]`;
             try {
-                metadata = await generateCopy(retryTranscript, videoPath);
-                validated = validateAndLog(metadata);
+                metadata = await generateCopy(retryTranscript, videoPath, isLongVideo);
+                validated = validateAndLog(metadata, { isLongVideo });
             } catch (err) {
                 logger.warn(`[Metadata] Regeneração falhou: ${err.message}`);
             }
@@ -303,12 +367,12 @@ async function generateCopyWithValidation(transcript, videoPath) {
 
 // ─── 6. Pipeline Completo ─────────────────────────────────────────────────────
 
-export async function generateMetadata(videoPath) {
+export async function generateMetadata(videoPath, { isLongVideo = false } = {}) {
     let audioPath = null;
     try {
         audioPath = await extractAudio(videoPath);
         const transcript = await transcribeAudio(audioPath);
-        const metadata = await generateCopyWithValidation(transcript, videoPath);
+        const metadata = await generateCopyWithValidation(transcript, videoPath, isLongVideo);
         return { ...metadata, transcript };
     } finally {
         if (audioPath && fs.existsSync(audioPath)) {
@@ -338,7 +402,7 @@ export function formatTikTokCaption(metadata) {
     return parts.join('\n\n').slice(0, 2200);
 }
 
-export function generateFallbackMetadata(filename) {
+export function generateFallbackMetadata(filename, isLongVideo = false) {
     logger.warn('[Metadata] APIs não configuradas — usando título baseado no arquivo.');
     const base = path.basename(filename, '.mp4')
         .replace(/^\d+__/, '')
@@ -348,7 +412,9 @@ export function generateFallbackMetadata(filename) {
     return {
         titulo: base.substring(0, 60) || 'Momento imperdível da live',
         descricao: 'Inscreva-se para mais cortes! 🎬',
-        hashtags: '#shorts #cortespodcast #cortes #podcast #viral',
+        hashtags: isLongVideo
+            ? '#futebol #esporte #cortes #viral'
+            : '#shorts #cortespodcast #cortes #podcast #viral',
         thumbText: '',
     };
 }

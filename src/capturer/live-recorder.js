@@ -39,6 +39,7 @@ export async function recordLiveStream(channel, minutesToRecord = 30) {
             '--no-playlist',
             '--live-from-start',           // baixa do início do live (se disponível)
             '--download-sections', `*0-${durationSec}`, // para após N segundos
+            '--extractor-args', 'youtube:player_client=android',
             '-f', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best',
             '--merge-output-format', 'mp4',
             '-o', outFile,

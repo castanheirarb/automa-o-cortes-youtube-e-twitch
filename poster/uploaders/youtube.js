@@ -8,7 +8,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { logger } from '../logger.js';
 
-const PROFILE_DIR = path.resolve('./profiles/chrome-youtube');
+const DEFAULT_PROFILE_DIR = path.resolve('./profiles/chrome-youtube');
 
 const CHROME_EXEC = process.env.CHROME_PATH
     || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
@@ -48,6 +48,12 @@ const SEL = {
         '#textbox[aria-label*="scrição"]',
         '#textbox[aria-label*="escription"]',
     ],
+    madeForKids: [
+        'tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_MFK"]',
+        '#radioLabel:has-text("Sim, é conteúdo")',
+        '#radioLabel:has-text("Yes, it")',
+        'ytcp-radio-group ytcp-radio-button:first-child #radioLabel',
+    ],
     notForKids: [
         'tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"]',
         '#radioLabel:has-text("Não, não")',
@@ -57,8 +63,15 @@ const SEL = {
     nextBtn: [
         'ytcp-button#next-button',
         'ytcp-stepper-footer #next-button',
+        'ytcp-stepper-footer ytcp-button',
         'button[aria-label="Próximo"]',
         'button[aria-label="Next"]',
+        'button[aria-label="Avançar"]',
+        'ytcp-button:has-text("Próximo")',
+        'ytcp-button:has-text("Next")',
+        'ytcp-button:has-text("Avançar")',
+        '[id="next-button"]',
+        '#next-button',
     ],
     publicVisibility: [
         'tp-yt-paper-radio-button[name="PUBLIC"]',
@@ -77,7 +90,17 @@ const SEL = {
     publishConfirm: [
         'ytcp-video-info',
         'div[role="dialog"] a[href*="watch"]',
+        'div[role="dialog"] a[href*="/shorts/"]',
         '.ytcp-video-share-url',
+    ],
+    // Marca o modal "Video published"/"Vídeo publicado" que o Studio mostra
+    // quando o upload já foi concluído — usado como checagem final de
+    // segurança antes de declarar falha (ver isVideoPublished).
+    publishedDialog: [
+        ':text("Video published")',
+        ':text("Vídeo publicado")',
+        'div[role="dialog"] a[href*="youtube.com/shorts/"]',
+        'div[role="dialog"] a[href*="youtu.be/"]',
     ],
     thumbnailInput: 'input[type="file"][accept*="image"]',
     copyrightError: [
@@ -99,9 +122,9 @@ const SEL = {
 
 // ─── Browser ──────────────────────────────────────────────────────────────────
 
-async function launchBrowser(headless) {
-    logger.info(`[YouTube] Perfil: ${PROFILE_DIR}`);
-    return chromium.launchPersistentContext(PROFILE_DIR, {
+async function launchBrowser(headless, profileDir = DEFAULT_PROFILE_DIR) {
+    logger.info(`[YouTube] Perfil: ${profileDir}`);
+    return chromium.launchPersistentContext(profileDir, {
         executablePath: CHROME_EXEC,
         headless: headless === true,
         args: [
@@ -142,6 +165,23 @@ async function tryClick(page, selectors, timeout = 20000) {
 }
 
 /**
+ * Checagem de segurança: mesmo que um passo do wizard (ex.: clique em
+ * "Publicar") tenha lançado erro por seletor desatualizado, o vídeo pode já
+ * ter sido publicado de fato — o Studio troca o modal para "Video published"
+ * quase instantaneamente. Sem essa checagem, esses casos eram registrados
+ * como falha e o clipe reentrava na fila, arriscando duplicata.
+ * @returns {Promise<boolean>}
+ */
+async function isVideoPublished(page) {
+    for (const sel of SEL.publishedDialog) {
+        try {
+            if (await page.locator(sel).first().isVisible({ timeout: 1500 })) return true;
+        } catch { /* tenta o próximo */ }
+    }
+    return false;
+}
+
+/**
  * Aguarda (por polling) que um dos seletores fique visível na página.
  * Retorna o locator do primeiro elemento encontrado, ou null se timeout.
  */
@@ -170,43 +210,49 @@ async function waitForAny(page, selectors, timeoutMs = 30000) {
 
 /**
  * Preenche um campo contenteditable do YouTube Studio.
- * Usa paste via DataTransfer — evita autocomplete e seleções acidentais.
+ *
+ * Antes isso era feito disparando um ClipboardEvent('paste') sintético via
+ * page.evaluate(). Dois problemas com isso, descobertos revisando o pipeline:
+ *   1. O evento tem isTrusted=false e quase nunca lança exceção — então a
+ *      variável que checava "deu certo" ficava sempre true mesmo quando o
+ *      editor do YouTube Studio ignorava o evento sintético e o campo
+ *      continuava vazio (o fallback de digitação real nunca era acionado).
+ *      Isso explica descrições saindo em branco sem nenhum erro no log.
+ *   2. Eventos DOM sintéticos (isTrusted=false) são um sinal clássico de
+ *      automação para heurísticas anti-bot.
+ * Agora usa page.keyboard.type() (input real via CDP, mesmo mecanismo já
+ * usado com sucesso no caption do TikTok) e confere se o texto realmente
+ * apareceu no campo antes de seguir, tentando de novo uma vez se não bateu.
  */
 async function fillField(page, el, text) {
-    await el.scrollIntoViewIfNeeded().catch(() => {});
-    await el.click({ force: true });
-    await page.waitForTimeout(300).catch(() => {});
-
-    // Seleciona e apaga o conteúdo atual do campo
-    await page.keyboard.press('Control+a');
-    await page.waitForTimeout(100).catch(() => {});
-    await page.keyboard.press('Backspace');
-    await page.waitForTimeout(150).catch(() => {});
-
-    // Cola via ClipboardEvent — YouTube Studio aceita e não aciona autocomplete
-    const pasted = await page.evaluate((t) => {
-        try {
-            const dt = new DataTransfer();
-            dt.setData('text/plain', t);
-            document.activeElement.dispatchEvent(
-                new ClipboardEvent('paste', { clipboardData: dt, bubbles: true })
-            );
-            return true;
-        } catch {
-            return false;
-        }
-    }, text);
-
-    await page.waitForTimeout(400).catch(() => {});
-
-    if (!pasted) {
-        // Fallback: type() caracter a caracter
-        await page.keyboard.type(text, { delay: 35 });
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        await el.scrollIntoViewIfNeeded().catch(() => {});
+        await el.click({ force: true });
         await page.waitForTimeout(300).catch(() => {});
-    }
 
-    // Fecha sugestões sem mover o foco para outro campo
-    await page.keyboard.press('Escape').catch(() => {});
+        // Seleciona e apaga o conteúdo atual do campo
+        await page.keyboard.press('Control+a');
+        await page.waitForTimeout(100).catch(() => {});
+        await page.keyboard.press('Backspace');
+        await page.waitForTimeout(150).catch(() => {});
+
+        // Digitação real (trusted input) — evita o problema do paste sintético acima
+        await page.keyboard.type(text, { delay: 20 + Math.random() * 20 });
+        await page.waitForTimeout(400).catch(() => {});
+        // NÃO pressiona Escape aqui: quando não há popup de autocomplete aberto
+        // (comum ao digitar o título), o Escape fecha o MODAL DE UPLOAD INTEIRO
+        // em vez de só a sugestão — foi isso que causou o vídeo publicar sem
+        // descrição/miniatura/visibilidade (o diálogo fechava logo após o título).
+        // Clicar no próximo campo (feito pela próxima chamada de fillField) já
+        // dispensa qualquer sugestão aberta ao tirar o foco deste campo.
+
+        const current = (await el.innerText().catch(() => '')).trim();
+        if (current.length > 0 && current.replace(/\s+/g, ' ').includes(text.trim().slice(0, 20).replace(/\s+/g, ' '))) {
+            return;
+        }
+        logger.warn(`[YouTube] Campo não confirmou o texto na tentativa ${attempt}/2 (conteúdo atual: "${current.slice(0, 40)}").`);
+    }
+    throw new Error('Campo não aceitou o texto digitado após 2 tentativas.');
 }
 
 async function tryType(page, selectors, text, timeoutMs = 25000) {
@@ -249,12 +295,133 @@ async function checkCopyright(page) {
     return { ok: true, warnings: [] };
 }
 
+/**
+ * Aguarda o envio do arquivo terminar antes de publicar.
+ * Shorts (~10 MB) terminam antes do wizard acabar, mas vídeos longos (centenas
+ * de MB) ainda estão em "Enviando X%" quando chegamos na tela de Visibilidade —
+ * clicar em Publicar nesse estado deixa o botão inerte e o fluxo antigo
+ * estourava o timeout e FECHAVA o navegador no meio do envio (vídeo preso em
+ * rascunho a X%). Faz polling do texto de progresso do modal até ele parar de
+ * dizer "Enviando/Uploading".
+ */
+/**
+ * Classifica o texto do label de progresso do Studio.
+ *
+ * ATENÇÃO: "Checking X%" / "Verificando X%" NÃO significa envio concluído —
+ * o YouTube ainda está recebendo/analisando o arquivo. Tratar esse estado como
+ * pronto foi o que deixou os vídeos longos presos em "Envio interrompido":
+ * o robô publicava e fechava o navegador no meio da transferência.
+ */
+function parseProgressState(text) {
+    if (!text) return 'ausente';
+    const t = text.trim().toLowerCase();
+    const pctMatch = t.match(/(\d{1,3})\s*%/);
+    const pct = pctMatch ? parseInt(pctMatch[1], 10) : null;
+
+    // Sinais de que os bytes já chegaram (transcodificação/checagem final)
+    if (/(envio conclu|upload complete|uploaded|processando|processing|verifica[çc][õo]es conclu|checks? complete)/i.test(t)) {
+        return 'concluido';
+    }
+    // Ainda transferindo ou analisando o arquivo
+    if (/(enviando|uploading|fazendo upload|checking|verificando)/i.test(t)) {
+        return pct !== null && pct >= 100 ? 'concluido' : 'enviando';
+    }
+    return 'ausente';
+}
+
+async function readProgressLabel(page) {
+    return page
+        .locator('ytcp-video-upload-progress .progress-label, span.progress-label')
+        .first()
+        .textContent({ timeout: 3000 })
+        .catch(() => null);
+}
+
+// Segundo sinal de progresso, independente do texto: barra de progresso via
+// aria-valuenow. Só é usado como confirmação POSITIVA (>=100) — nunca como
+// base pra "adivinhar" conclusão a partir da ausência de alguma coisa.
+async function readProgressBarPercent(page) {
+    try {
+        const el = page.locator('ytcp-video-upload-progress [role="progressbar"], [role="progressbar"]').first();
+        const val = await el.getAttribute('aria-valuenow', { timeout: 1500 });
+        return val !== null ? parseFloat(val) : null;
+    } catch {
+        return null;
+    }
+}
+
+async function waitForUploadComplete(page, fileSizeMB) {
+    // ~1 min por 10 MB, mínimo 15 min, teto configurável (padrão 90 min).
+    // A checagem final do YouTube costuma anunciar "10 minutes left" mesmo em
+    // arquivos pequenos, então o piso é generoso de propósito.
+    const capMin = parseInt(process.env.YT_UPLOAD_WAIT_MAX_MIN || '90', 10);
+    const timeoutMs = Math.min(capMin, Math.max(15, Math.ceil(fileSizeMB / 10))) * 60_000;
+    const deadline = Date.now() + timeoutMs;
+    let lastLogged = '';
+
+    // IMPORTANTE: já tivemos DOIS falsos positivos reais em produção tentando
+    // "adivinhar" conclusão a partir da AUSÊNCIA de algo (label sumiu; depois
+    // botão de publicar habilitado) — nos dois casos o Studio já deixava o
+    // botão clicável / o label sumia com o envio ainda em andamento (~82%),
+    // e o vídeo saía sem publicar de fato. Por isso agora só existem sinais
+    // POSITIVOS e explícitos de conclusão (texto "concluído/checks complete"
+    // ou barra em 100%). Sem eles, o código espera até o timeout calculado
+    // pelo tamanho do arquivo — mais lento, mas nunca clica Publicar cedo.
+    while (Date.now() < deadline) {
+        const text = await readProgressLabel(page);
+        const state = parseProgressState(text);
+
+        if (state === 'concluido') {
+            logger.info(`[YouTube] Envio do arquivo concluído (${text.trim()}).`);
+            return true;
+        }
+
+        const pct = await readProgressBarPercent(page);
+        if (pct !== null && pct >= 100) {
+            logger.info(`[YouTube] Barra de progresso em 100% — envio concluído.`);
+            return true;
+        }
+
+        if (state !== 'ausente') {
+            const clean = text.trim();
+            if (clean !== lastLogged) {
+                logger.info(`[YouTube] ${clean} (aguardando o envio terminar...)`);
+                lastLogged = clean;
+            }
+        }
+
+        await page.waitForTimeout(10_000).catch(() => {});
+    }
+
+    logger.error(`[YouTube] Envio NÃO terminou em ${Math.round(timeoutMs / 60_000)}min.`);
+    return false;
+}
+
+/**
+ * Depois de publicar, segura o navegador aberto enquanto o Studio ainda estiver
+ * transferindo. Fechar antes disso é exatamente o que produz o estado
+ * "Envio interrompido — Retomar o envio" no painel.
+ */
+async function waitBeforeClosing(page, fileSizeMB) {
+    const capMin = parseInt(process.env.YT_UPLOAD_WAIT_MAX_MIN || '90', 10);
+    const deadline = Date.now() + Math.min(capMin, Math.max(10, Math.ceil(fileSizeMB / 10))) * 60_000;
+
+    while (Date.now() < deadline) {
+        const state = parseProgressState(await readProgressLabel(page));
+        if (state !== 'enviando') return true;
+        logger.info('[YouTube] Ainda enviando após publicar — mantendo o navegador aberto...');
+        await page.waitForTimeout(15_000).catch(() => {});
+    }
+    logger.warn('[YouTube] Tempo esgotado aguardando o fim do envio antes de fechar.');
+    return false;
+}
+
 // ─── Fluxo Principal ──────────────────────────────────────────────────────────
 
-export async function uploadToYouTube(filePath, title, description = '', headless = true, thumbnailPath = null) {
+export async function uploadToYouTube(filePath, title, description = '', headless = true, thumbnailPath = null, profileDir = DEFAULT_PROFILE_DIR, madeForKids = false) {
     logger.step(`[YouTube] Iniciando upload: ${path.basename(filePath)}`);
 
-    const context = await launchBrowser(headless);
+    const context = await launchBrowser(headless, profileDir);
     const page = await context.newPage();
 
     try {
@@ -308,6 +475,17 @@ export async function uploadToYouTube(filePath, title, description = '', headles
         logger.info(`[YouTube] Título: "${title.substring(0, 60)}..."`);
         await page.waitForTimeout(1000).catch(() => {});
 
+        // Sanity check: confirma que o modal de upload ainda está aberto antes de
+        // seguir. Sem isso, se o diálogo fechar sozinho por qualquer motivo, o
+        // código gastava 15-20s tentando achar campos que nunca mais vão aparecer
+        // e o vídeo publicava incompleto (sem descrição/miniatura/visibilidade).
+        const stillInModal = await page.locator(SEL.titleInput[0]).first().isVisible({ timeout: 3000 }).catch(() => false);
+        if (!stillInModal) {
+            const shotPath = `./poster-error-modal-closed-${Date.now()}.png`;
+            await page.screenshot({ path: shotPath }).catch(() => {});
+            throw new Error(`O modal de upload fechou sozinho logo após o título. Screenshot: ${shotPath}`);
+        }
+
         // 5b. Preenche descrição
         if (description) {
             logger.info('[YouTube] Preenchendo descrição...');
@@ -315,7 +493,13 @@ export async function uploadToYouTube(filePath, title, description = '', headles
                 await tryType(page, SEL.descriptionInput, description, 15000);
                 logger.info('[YouTube] Descrição preenchida.');
             } catch (err) {
-                logger.warn(`[YouTube] Descrição não preenchida: ${err.message}`);
+                // Antes era só um warning e o vídeo seguia sem descrição, silenciosamente.
+                // Com fillField() agora verificando o conteúdo antes de dar certo, chegar
+                // aqui é raro — mas quando acontece precisa ficar visível, não escondido.
+                logger.error(`[YouTube] ⚠️  Descrição NÃO foi preenchida — vídeo vai publicar sem descrição: ${err.message}`);
+                const shotPath = `./poster-warning-no-description-${Date.now()}.png`;
+                await page.screenshot({ path: shotPath }).catch(() => {});
+                logger.error(`[YouTube] Screenshot salvo: ${shotPath}`);
             }
             await page.waitForTimeout(800).catch(() => {});
         }
@@ -324,7 +508,29 @@ export async function uploadToYouTube(filePath, title, description = '', headles
         if (thumbnailPath && fs.existsSync(thumbnailPath)) {
             try {
                 logger.info('[YouTube] Enviando thumbnail personalizada...');
-                const thumbInput = await page.waitForSelector(SEL.thumbnailInput, { timeout: 8000, state: 'attached' });
+
+                // O input de arquivo fica oculto até clicar em "Miniatura personalizada"
+                const THUMB_BTN_SELECTORS = [
+                    'ytcp-thumbnails-compact-editor-uploader',
+                    '[aria-label*="miniatura"]',
+                    '[aria-label*="thumbnail"]',
+                    ':text("Fazer upload de uma miniatura")',
+                    ':text("Upload thumbnail")',
+                    ':text("Miniatura personalizada")',
+                    ':text("Custom thumbnail")',
+                ];
+                for (const sel of THUMB_BTN_SELECTORS) {
+                    try {
+                        const btn = page.locator(sel).first();
+                        if (await btn.isVisible({ timeout: 2000 })) {
+                            await btn.click().catch(() => {});
+                            await page.waitForTimeout(800).catch(() => {});
+                            break;
+                        }
+                    } catch { /* tenta o próximo */ }
+                }
+
+                const thumbInput = await page.waitForSelector(SEL.thumbnailInput, { timeout: 10000, state: 'attached' });
                 await thumbInput.setInputFiles(thumbnailPath);
                 await page.waitForTimeout(2500).catch(() => {});
                 logger.success('[YouTube] Thumbnail enviada.');
@@ -333,15 +539,18 @@ export async function uploadToYouTube(filePath, title, description = '', headles
             }
         }
 
-        // 6. Não é conteúdo infantil
-        logger.info('[YouTube] Marcando "Não é conteúdo infantil"...');
+        // 6. Público-alvo (obrigatório e sujeito a regras de proteção infantil).
+        // Canal infantil PRECISA marcar "feito para crianças"; declarar errado
+        // é violação das regras do YouTube/COPPA, não só um detalhe de metadado.
+        const rotulo = madeForKids ? 'É conteúdo para crianças' : 'Não é conteúdo infantil';
+        logger.info(`[YouTube] Marcando "${rotulo}"...`);
         try {
             await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
             await page.waitForTimeout(500).catch(() => {});
-            await tryClick(page, SEL.notForKids, 12000);
-            logger.info('[YouTube] "Não é conteúdo infantil" marcado.');
+            await tryClick(page, madeForKids ? SEL.madeForKids : SEL.notForKids, 12000);
+            logger.info(`[YouTube] "${rotulo}" marcado.`);
         } catch {
-            logger.warn('[YouTube] "Não é conteúdo infantil" não encontrado — pode já estar selecionado.');
+            logger.warn(`[YouTube] "${rotulo}" não encontrado — verificar manualmente!`);
         }
         await page.waitForTimeout(500).catch(() => {});
 
@@ -376,13 +585,33 @@ export async function uploadToYouTube(filePath, title, description = '', headles
         }
         await page.waitForTimeout(1000).catch(() => {});
 
-        // 11. Aguarda processamento mínimo
-        logger.info('[YouTube] Aguardando processamento...');
-        await page.waitForTimeout(5000).catch(() => {});
+        // 11. Aguarda o ENVIO do arquivo terminar (crítico para vídeos longos)
+        const fileSizeMB = fs.statSync(filePath).size / (1024 * 1024);
+        logger.info(`[YouTube] Aguardando envio do arquivo (${Math.round(fileSizeMB)} MB)...`);
+        const enviado = await waitForUploadComplete(page, fileSizeMB);
+
+        // Publicar com o arquivo ainda subindo deixa o vídeo preso em
+        // "Envio interrompido" — melhor falhar e deixar o clipe para o próximo
+        // ciclo do que registrar como publicado algo que não foi.
+        if (!enviado) {
+            const shot = `./poster-error-youtube-${Date.now()}.png`;
+            await page.screenshot({ path: shot }).catch(() => {});
+            logger.error(`[YouTube] Abortando publicação — envio incompleto. Screenshot: ${shot}`);
+            return false;
+        }
 
         // 12. Publicar
         logger.info('[YouTube] Publicando...');
-        await tryClick(page, SEL.publishBtn, 30000);
+        try {
+            await tryClick(page, SEL.publishBtn, 30000);
+        } catch (clickErr) {
+            // O botão pode já ter sido clicado (ou o Studio publicou sem ele)
+            // antes do seletor conseguir confirmar — checa o modal de sucesso
+            // antes de desistir, senão um vídeo publicado é registrado como
+            // falha e o clipe volta pra fila arriscando duplicata.
+            if (!(await isVideoPublished(page))) throw clickErr;
+            logger.warn('[YouTube] Botão "Publicar" não respondeu a tempo, mas o modal de publicação já apareceu — seguindo como sucesso.');
+        }
 
         // 13. Confirma publicação
         await Promise.race(
@@ -390,6 +619,9 @@ export async function uploadToYouTube(filePath, title, description = '', headles
                 page.waitForSelector(sel, { timeout: 60000 }).catch(() => null)
             )
         );
+
+        // 14. Só fecha o navegador quando o Studio parar de transferir
+        await waitBeforeClosing(page, fileSizeMB);
 
         if (warnings.length > 0) {
             logger.success(`[YouTube] ✅ Publicado (com ${warnings.length} aviso(s) de copyright).`);
@@ -399,6 +631,15 @@ export async function uploadToYouTube(filePath, title, description = '', headles
         return true;
 
     } catch (err) {
+        // Rede de segurança final: qualquer passo depois do upload em si
+        // (thumbnail, verificações, wizard de visibilidade) pode lançar por
+        // seletor desatualizado mesmo com o vídeo já publicado de fato —
+        // checa o modal de sucesso antes de declarar falha e reenfileirar
+        // um clipe que na verdade já foi ao ar.
+        if (await isVideoPublished(page).catch(() => false)) {
+            logger.warn(`[YouTube] Falha em "${err.message}", mas o modal de publicação está visível — vídeo já publicado, seguindo como sucesso.`);
+            return true;
+        }
         logger.error(`[YouTube] Falha no upload: ${err.message}`);
         const shot = `./poster-error-youtube-${Date.now()}.png`;
         await page.screenshot({ path: shot }).catch(() => {});

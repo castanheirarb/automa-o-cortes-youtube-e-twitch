@@ -55,6 +55,37 @@ export async function fetchLatestYouTubeVideo(channelUrl, offset = 1) {
     };
 }
 
+/**
+ * Lista os N vídeos mais recentes de um canal do YouTube (sem baixar nada).
+ *
+ * @param {string} channelUrl - URL do canal + /videos
+ * @param {number} [limit=15] - Quantos vídeos listar
+ * @returns {Promise<Array<{ videoUrl: string, title: string, duration: number|null, id: string }>>}
+ */
+export async function fetchYouTubeVideoList(channelUrl, limit = 15) {
+    const ytDlp = getYtDlpBin();
+    logger.info(`[Fetcher] Listando os ${limit} vídeos mais recentes de: ${channelUrl}`);
+
+    const { stdout } = await execFileAsync(ytDlp, [
+        '--dump-json',
+        '--no-playlist',
+        '--playlist-end', String(limit),
+        '--skip-download',
+        '--flat-playlist',
+        channelUrl,
+    ], { maxBuffer: 20 * 1024 * 1024 });
+
+    return stdout.trim().split('\n').filter(Boolean).map((line) => {
+        const entry = JSON.parse(line);
+        return {
+            videoUrl: entry.url?.startsWith('http') ? entry.url : `https://www.youtube.com/watch?v=${entry.id}`,
+            title: entry.title || entry.id,
+            duration: entry.duration || null,
+            id: entry.id,
+        };
+    });
+}
+
 // ─── Twitch ───────────────────────────────────────────────────────────────────
 
 const TWITCH_API_BASE = 'https://api.twitch.tv/helix';

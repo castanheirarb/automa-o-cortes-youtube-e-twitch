@@ -32,7 +32,7 @@ async function searchChannel(channelUrl) {
         '--dump-json',
         '--flat-playlist',
         '--playlist-end', '5', // Analisa os 5 vídeos mais recentes
-        '--dateafter', 'now-2d', // Filtra vídeos das últimas 48h
+        '--dateafter', 'now-2days', // Filtra vídeos das últimas 48h
         channelUrl,
     ];
 

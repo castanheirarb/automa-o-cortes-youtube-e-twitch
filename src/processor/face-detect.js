@@ -126,7 +126,7 @@ export async function extractBestFrame(videoPath) {
         const time = (duration / (frameCount + 1)) * (i + 1);
         const framePath = path.join(os.tmpdir(), `frame-best-${i}-${Date.now()}.jpg`);
         try {
-            await execFileAsync(ffmpegPath, ['-ss', String(time), '-i', videoPath, '-vframes', '1', '-q:v', '2', '-y', framePath]);
+            await execFileAsync(ffmpegPath, ['-ss', String(time), '-i', videoPath, '-vframes', '1', '-pix_fmt', 'yuvj420p', '-q:v', '2', '-y', framePath]);
             const base64 = fs.readFileSync(framePath).toString('base64');
             frames.push({ path: framePath, base64 });
         } catch (err) {
@@ -165,4 +165,91 @@ export async function extractBestFrame(videoPath) {
         frames.forEach((f) => { if (fs.existsSync(f.path)) fs.unlinkSync(f.path); });
         return null;
     }
+}
+
+// ─── Classificação de cena → layout automático ───────────────────────────────
+// Decide o formato do clipe pelo CONTEÚDO do quadro, não pela persona:
+// o mesmo canal alterna "just chatting" (webcam grande) e gameplay em tela
+// cheia, e cada caso pede um enquadramento diferente.
+//
+//   'asd'    → há pessoa/webcam com presença relevante → crop 9:16 no rosto
+//   'hybrid' → jogo/tela ocupando o quadro todo, sem rosto relevante →
+//              painel 16:9 nativo (preserva HUD, evita upscale de 1,78×)
+
+async function classifyFrame(framePath) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return null;
+
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.5-flash' });
+
+    const image = {
+        inlineData: {
+            data: Buffer.from(fs.readFileSync(framePath)).toString('base64'),
+            mimeType: 'image/jpeg',
+        },
+    };
+
+    const prompt =
+        'This is a frame from a livestream clip. Answer with ONE word only:\n' +
+        '"FACE" if a person\'s face/webcam is clearly visible AND takes up a meaningful ' +
+        'part of the frame (roughly 15% of the width or more) — typical of just-chatting, ' +
+        'reactions, podcasts, or webcam-dominant stream layouts.\n' +
+        '"GAME" if the frame is mostly full-screen gameplay, a screen share, or UI, ' +
+        'with no face or only a tiny face overlay.\n' +
+        'Answer: FACE or GAME.';
+
+    const result = await model.generateContent([prompt, image]);
+    const raw = result.response.text().trim().toUpperCase();
+    if (raw.includes('FACE')) return 'face';
+    if (raw.includes('GAME')) return 'game';
+    logger.warn(`[SceneDetect] Resposta inesperada do Gemini: "${raw}"`);
+    return null;
+}
+
+/**
+ * Analisa amostras do trecho e devolve o layout recomendado.
+ * Fallback seguro: 'asd' (comportamento atual) quando indeterminado.
+ *
+ * @returns {Promise<'asd'|'hybrid'>}
+ */
+export async function detectSceneLayout(videoStreamUrl, startTime, endTime) {
+    if (!process.env.GEMINI_API_KEY) {
+        logger.warn('[SceneDetect] GEMINI_API_KEY ausente — mantendo layout padrão (asd).');
+        return 'asd';
+    }
+
+    const SAMPLE_COUNT = 3;
+    const step = (endTime - startTime) / (SAMPLE_COUNT + 1);
+    const times = Array.from({ length: SAMPLE_COUNT }, (_, i) => startTime + step * (i + 1));
+
+    const votes = { face: 0, game: 0 };
+    for (const t of times) {
+        // Saída antecipada: 2 votos iguais já decidem a maioria de 3 amostras.
+        // Economiza chamadas à API (a cota do Gemini é compartilhada com a
+        // geração de copy e thumbnails).
+        if (votes.face >= 2 || votes.game >= 2) break;
+
+        let framePath = null;
+        try {
+            framePath = await extractFrame(videoStreamUrl, t);
+            const v = await classifyFrame(framePath);
+            if (v) votes[v]++;
+        } catch (err) {
+            logger.warn(`[SceneDetect] Falha ao analisar frame em ${Math.floor(t)}s: ${err.message}`);
+        } finally {
+            if (framePath && fs.existsSync(framePath)) { try { fs.unlinkSync(framePath); } catch { /* ignora */ } }
+        }
+    }
+
+    if (votes.face === 0 && votes.game === 0) {
+        logger.warn('[SceneDetect] Sem classificação válida — mantendo layout padrão (asd).');
+        return 'asd';
+    }
+
+    // Empate ou maioria de rosto → 'asd' (mais seguro: foi o formato que venceu
+    // o teste A/B em conteúdo com webcam). Só vai para 'hybrid' com maioria clara.
+    const layout = votes.game > votes.face ? 'hybrid' : 'asd';
+    logger.success(`[SceneDetect] Cena: ${votes.face} rosto / ${votes.game} jogo → layout "${layout}".`);
+    return layout;
 }

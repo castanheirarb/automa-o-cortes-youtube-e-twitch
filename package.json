@@ -14,26 +14,58 @@
     "capture:force": "node src/orchestrator.js --force",
     "live": "node src/orchestrator.js --live",
     "full": "node src/orchestrator.js && node poster/index.js --now",
-    "poster": "node poster/index.js",
+    "poster": "node start.js",
+    "poster:solo": "node poster/index.js",
     "poster:now": "node poster/index.js --now",
     "poster:tiktok": "node poster/index.js --now --tiktok-only",
     "poster:youtube": "node poster/index.js --now --youtube-only",
+    "poster:longo": "node poster/index.js --long-now",
+    "poster:longo:fe": "node poster/index.js --long-now --persona bispobrunoleonardo",
     "poster:dry": "node poster/index.js --dry-run",
+    "hotness": "node src/scheduler/hotness.js",
     "poster:login": "node poster/login.js",
-    "regen-captions": "node regen-captions.js"
+    "trend:capture": "node src/trend-hunter/trend-capture.js",
+    "regen-captions": "node regen-captions.js",
+    "radar:start": "node src/capturer/sports-radar.js",
+    "radar:watchdog": "node src/capturer/watchdog.js",
+    "radar:add": "node src/capturer/schedule-add.js",
+    "radar:list": "node src/capturer/schedule-add.js",
+    "radar:cancel": "node src/capturer/schedule-add.js",
+    "mine:sports": "node src/capturer/sports-vod-miner.js",
+    "sports:monitor": "node src/orchestrator.js --sports-monitor",
+    "obs:mirror": "node src/obs/cli.js mirror",
+    "obs:start": "node src/obs/cli.js start",
+    "obs:stop": "node src/obs/cli.js stop",
+    "obs:status": "node src/obs/cli.js status",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio",
+    "longo:replicate": "node src/trend-hunter/long-replicate.js",
+    "stock": "node src/stock-watcher.js",
+    "comment-bot": "node src/orchestrator.js --comment-monitor",
+    "comment-bot:dry": "node src/orchestrator.js --comment-monitor --dry-run",
+    "comment-bot:once": "node src/orchestrator.js --comment-monitor --dry-run --once",
+    "youtube:oauth-setup": "node poster/youtube-oauth-setup.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
+    "@prisma/client": "^5.22.0",
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
     "fluent-ffmpeg": "^2.1.3",
+    "googleapis": "^144.0.0",
     "groq-sdk": "^0.37.0",
-    "node-cron": "^3.0.3",
+    "node-cron": "^4.6.0",
+    "obs-websocket-js": "^5.0.8",
     "playwright": "^1.49.1",
-    "sharp": "^0.34.5",
-    "ws": "^8.19.0"
+    "sharp": "^0.35.3",
+    "tiktok-live-connector": "^2.4.3",
+    "ws": "^8.21.3",
+    "youtube-chat": "^2.2.0"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.22.0"
   }
 }

@@ -17,6 +17,12 @@ export async function runTrendHunter() {
         return [];
     }
 
-    const top10 = await rankTargets(allTargets);
-    return top10;
+    try {
+        return await rankTargets(allTargets);
+    } catch (err) {
+        // Uma falha do Gemini (resposta truncada, JSON inválido, etc.) não pode
+        // derrubar o serviço inteiro — sem isso o HUNTER ficava 12h parado a cada erro.
+        logger.error(`[TrendHunter] Ranker falhou: ${err.message}`);
+        return [];
+    }
 }

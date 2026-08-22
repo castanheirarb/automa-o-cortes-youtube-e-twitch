@@ -9,7 +9,10 @@ export async function rankTargets(targets) {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({
         model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-        generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
+        // maxOutputTokens em 2048 truncava o JSON do top10 no meio (resposta
+        // cortada = JSON inválido = crash). responseMimeType evita o Gemini
+        // envolver a resposta em ```json e garante que ele já feche o JSON.
+        generationConfig: { temperature: 0.3, maxOutputTokens: 8192, responseMimeType: 'application/json' },
     });
 
     const prompt = `Você é um Analista de Viralidade especialista em YouTube Shorts e TikTok. Analise a lista de vídeos/clips abaixo e selecione os 10 com maior potencial para gerar cortes virais.

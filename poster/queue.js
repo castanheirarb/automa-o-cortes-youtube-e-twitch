@@ -6,12 +6,14 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { logger } from './logger.js';
 
 const OUTPUT_DIR = path.resolve('./output');
 const POSTED_DIR = path.resolve('./postados');
 const REGISTRY_PATH = path.join(POSTED_DIR, 'registry.json');
 const TIKTOK_REGISTRY_PATH = path.join(POSTED_DIR, 'tiktok-registry.json');
+const YOUTUBE_REGISTRY_PATH = path.join(POSTED_DIR, 'youtube-registry.json');
 
 // ─── Registry (deduplicação) ──────────────────────────────────────────────────
 
@@ -174,6 +176,55 @@ export function registerTikTokPosted(filePath) {
     logger.info(`[Queue] Registrado no tiktok-registry: ${key}`);
 }
 
+// ─── Registry YouTube (deduplicação por plataforma) ──────────────────────────
+// Mesmo padrão do tiktok-registry: registra ANTES de iniciar o upload para que
+// uma interrupção do processo (Ctrl+C, crash) não cause re-postagem do mesmo vídeo.
+
+function loadYouTubeRegistry() {
+    try {
+        if (fs.existsSync(YOUTUBE_REGISTRY_PATH)) {
+            const data = JSON.parse(fs.readFileSync(YOUTUBE_REGISTRY_PATH, 'utf-8'));
+            return new Set(Array.isArray(data) ? data : []);
+        }
+    } catch (err) {
+        logger.warn(`[Queue] Falha ao ler youtube-registry.json: ${err.message} — usando registry vazio.`);
+    }
+    return new Set();
+}
+
+function saveYouTubeRegistry(registry) {
+    ensureDirs();
+    try {
+        fs.writeFileSync(YOUTUBE_REGISTRY_PATH, JSON.stringify([...registry], null, 2), 'utf-8');
+    } catch (err) {
+        logger.warn(`[Queue] Falha ao salvar youtube-registry.json: ${err.message}`);
+    }
+}
+
+/**
+ * Verifica se um arquivo já foi enviado ao YouTube (tentado ou confirmado).
+ * @param {string} filePath - caminho absoluto do arquivo
+ * @returns {boolean}
+ */
+export function isYouTubePosted(filePath) {
+    const registry = loadYouTubeRegistry();
+    const key = registryKey(filePath);
+    return registry.has(key) || registry.has(path.basename(filePath));
+}
+
+/**
+ * Registra um arquivo como enviado ao YouTube.
+ * Deve ser chamado ANTES de iniciar o upload para evitar duplicatas em caso de crash.
+ * @param {string} filePath - caminho absoluto do arquivo
+ */
+export function registerYouTubePosted(filePath) {
+    const registry = loadYouTubeRegistry();
+    const key = registryKey(filePath);
+    registry.add(key);
+    saveYouTubeRegistry(registry);
+    logger.info(`[Queue] Registrado no youtube-registry: ${key}`);
+}
+
 // ─── Dirs ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -284,9 +335,8 @@ export function getNextVideoFromPersona(personaDir, { dryRun = false } = {}) {
         return null;
     }
 
-    // Ordena por data de criação (mais antigo primeiro → FIFO)
-    mp4Files.sort((a, b) => fs.statSync(a).birthtimeMs - fs.statSync(b).birthtimeMs);
-
+    // Remove da fila os resíduos já postados (registry) e filtra os disponíveis
+    const available = [];
     for (const filePath of mp4Files) {
         if (isAlreadyPosted(filePath)) {
             logger.warn(`[Queue] Já postado (registry), pulando: ${path.basename(filePath)}`);
@@ -296,28 +346,97 @@ export function getNextVideoFromPersona(personaDir, { dryRun = false } = {}) {
             }
             continue;
         }
-
         // Em dry-run: pula vídeos já simulados em execuções anteriores
         // para que cada chamada a poster:dry avance para o próximo corte.
         if (dryRun && isDryShown(filePath)) {
             logger.warn(`[Queue] Dry-run: já simulado, pulando: ${path.basename(filePath)}`);
             continue;
         }
-
-        const basename = path.basename(filePath, '.mp4');
-        const title = formatTitle(basename);
-        logger.info(`[Queue] Próximo vídeo (${path.basename(personaDir)}): ${path.basename(filePath)}`);
-
-        // Registra no dry-registry para que a próxima execução avance para o próximo corte
-        if (dryRun) {
-            registerDryShown(filePath);
-        }
-
-        return { filePath, title };
+        available.push(filePath);
     }
 
-    logger.warn(`[Queue] Todos os vídeos de ${path.basename(personaDir)}/ já foram postados.`);
-    return null;
+    if (available.length === 0) {
+        logger.warn(`[Queue] Todos os vídeos de ${path.basename(personaDir)}/ já foram postados.`);
+        return null;
+    }
+
+    // ── Seleção com continuidade de contexto ──────────────────────────────────
+    // Clipes da mesma subpasta vêm do MESMO vídeo-fonte e formam uma sequência
+    // (1__, 2__, ...). Depois de postar o 1º, os turnos seguintes da persona
+    // continuam no mesmo vídeo, em ordem numérica, até esgotar a sequência.
+    // Sem sequência aberta, começa pelo vídeo-fonte com MAIS clipes restantes
+    // (maior peso = mais contexto encadeado); desempate pelo mais antigo.
+    const personaName = path.basename(personaDir);
+    const groups = new Map();
+    for (const f of available) {
+        const key = path.dirname(f);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(f);
+    }
+    const clipNum = (f) => {
+        const m = path.basename(f).match(/^(\d+)/);
+        return m ? parseInt(m[1], 10) : Number.MAX_SAFE_INTEGER;
+    };
+    for (const list of groups.values()) {
+        list.sort((a, b) => clipNum(a) - clipNum(b) || a.localeCompare(b));
+    }
+
+    const seqState = loadSequenceState();
+    let chosenGroup = seqState[personaName];
+    if (chosenGroup && groups.has(chosenGroup)) {
+        logger.info(
+            `[Queue] Continuando sequência de "${path.basename(chosenGroup)}" ` +
+            `(${groups.get(chosenGroup).length} clipe(s) restante(s)).`
+        );
+    } else {
+        chosenGroup = [...groups.keys()].sort((a, b) =>
+            groups.get(b).length - groups.get(a).length ||
+            fs.statSync(groups.get(a)[0]).birthtimeMs - fs.statSync(groups.get(b)[0]).birthtimeMs
+        )[0];
+        if (groups.size > 1) {
+            logger.info(
+                `[Queue] Nova sequência: "${path.basename(chosenGroup)}" ` +
+                `(${groups.get(chosenGroup).length} clipe(s) — maior contexto entre ${groups.size} vídeos-fonte).`
+            );
+        }
+    }
+
+    const filePath = groups.get(chosenGroup)[0];
+
+    // Persiste a sequência aberta (não em dry-run, que não deve mudar estado real)
+    if (!dryRun) {
+        seqState[personaName] = chosenGroup;
+        saveSequenceState(seqState);
+    }
+
+    const basename = path.basename(filePath, '.mp4');
+    const title = formatTitle(basename);
+    logger.info(`[Queue] Próximo vídeo (${personaName}): ${path.basename(filePath)}`);
+
+    // Registra no dry-registry para que a próxima execução avance para o próximo corte
+    if (dryRun) {
+        registerDryShown(filePath);
+    }
+
+    return { filePath, title };
+}
+
+// ─── Estado de sequência (continuidade de contexto por persona) ──────────────
+
+const SEQUENCE_STATE_FILE = path.join(POSTED_DIR, 'sequence-state.json');
+
+function loadSequenceState() {
+    try { return JSON.parse(fs.readFileSync(SEQUENCE_STATE_FILE, 'utf-8')); }
+    catch { return {}; }
+}
+
+function saveSequenceState(state) {
+    try {
+        if (!fs.existsSync(POSTED_DIR)) fs.mkdirSync(POSTED_DIR, { recursive: true });
+        fs.writeFileSync(SEQUENCE_STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
+    } catch (err) {
+        logger.warn(`[Queue] Falha ao salvar sequence-state: ${err.message}`);
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -357,4 +476,75 @@ function secondsToReadable(total) {
     const m = Math.floor((total % 3600) / 60);
     const s = total % 60;
     return h > 0 ? `${h}h ${m}m ${s}s` : `${m}m ${s}s`;
+}
+
+// ─── Dedup por CONTEÚDO (impressão digital) ──────────────────────────────────
+// O registry normal usa o CAMINHO do arquivo. Isso não pega o caso em que o
+// mesmo conteúdo é regerado com outro nome — foi o que causou a postagem do
+// mesmo vídeo longo em dois dias seguidos (compilação idêntica, nomes
+// diferentes por causa do Date.now()). O hash abaixo compara o conteúdo real.
+//
+// Para arquivos grandes, faz hash de amostras (início, meio e fim) + tamanho:
+// rápido e suficiente para detectar arquivos byte-a-byte iguais.
+
+const CONTENT_REGISTRY = path.join(POSTED_DIR, 'content-hashes.json');
+const SAMPLE_BYTES = 2 * 1024 * 1024; // 2 MB por amostra
+
+export function fileContentHash(filePath) {
+    const size = fs.statSync(filePath).size;
+    const hash = crypto.createHash('sha1');
+    hash.update(String(size));
+
+    const fd = fs.openSync(filePath, 'r');
+    try {
+        const offsets = [0, Math.max(0, Math.floor(size / 2) - SAMPLE_BYTES / 2), Math.max(0, size - SAMPLE_BYTES)];
+        const buf = Buffer.alloc(SAMPLE_BYTES);
+        for (const off of offsets) {
+            const read = fs.readSync(fd, buf, 0, Math.min(SAMPLE_BYTES, size - off), off);
+            if (read > 0) hash.update(buf.subarray(0, read));
+        }
+    } finally {
+        fs.closeSync(fd);
+    }
+    return hash.digest('hex');
+}
+
+function loadContentHashes() {
+    try { return JSON.parse(fs.readFileSync(CONTENT_REGISTRY, 'utf-8')); }
+    catch { return {}; }
+}
+
+/**
+ * True se um arquivo com ESTE CONTEÚDO já foi postado antes.
+ */
+export function isContentPosted(filePath) {
+    try {
+        const hashes = loadContentHashes();
+        const h = fileContentHash(filePath);
+        if (hashes[h]) {
+            logger.warn(`[Queue] Conteúdo idêntico já postado em ${hashes[h].postedAt}: "${hashes[h].file}"`);
+            return true;
+        }
+        return false;
+    } catch (err) {
+        logger.warn(`[Queue] Falha ao calcular hash de conteúdo: ${err.message} — seguindo sem esse check.`);
+        return false;
+    }
+}
+
+/**
+ * Registra a impressão digital do conteúdo postado.
+ */
+export function registerContentPosted(filePath) {
+    try {
+        const hashes = loadContentHashes();
+        hashes[fileContentHash(filePath)] = {
+            file: path.basename(filePath),
+            postedAt: new Date().toISOString(),
+        };
+        if (!fs.existsSync(POSTED_DIR)) fs.mkdirSync(POSTED_DIR, { recursive: true });
+        fs.writeFileSync(CONTENT_REGISTRY, JSON.stringify(hashes, null, 2), 'utf-8');
+    } catch (err) {
+        logger.warn(`[Queue] Falha ao registrar hash de conteúdo: ${err.message}`);
+    }
 }
