@@ -3,6 +3,38 @@ output/
 .env
 *.mp4
 *.json.tmp
+*.log
+
+# Estado de runtime / arquivos gerados a cada execução (ver CLAUDE.md — não
+# tratar como parte do código-fonte, mudam a cada rodada do poster/captura)
+logs/
+tmp/
+postados/
+profiles/
+
+# Estado/cache/registry do scheduler mudam a cada execução (ver CLAUDE.md,
+# seção "registra antes de tentar") — exceto queue-state.json, que já tem
+# histórico de commits anteriores e continua rastreado de propósito.
+scheduler/*.json
+scheduler/*.lock
+!scheduler/queue-state.json
+
+# Scratch pessoal (scripts de teste manual, não fazem parte do pipeline real)
+scratch-*.log
+ver5.mjs
+
+# Agenda Esportiva (Prisma/SQLite) — banco local, não versionar
+prisma/prisma/
+*.db
+
+# Screenshots de erro/aviso do poster (gerados automaticamente em falha de
+# upload — depuração pontual, não histórico permanente)
+/poster-error-*.png
+/poster-ambiguous-*.png
+/poster-warning-*.png
+
+# Isolamento de voz (Demucs)
+voice_isolation/venv/
 
 # Canal da Fé (subprojeto Python/Remotion)
 canal_da_fe/venv/
@@ -10,7 +42,14 @@ canal_da_fe/browser_profile/
 canal_da_fe/token.json
 canal_da_fe/client_secrets.json
 canal_da_fe/assets/
+canal_da_fe/output/
 canal_da_fe/__pycache__/
+canal_da_fe/.env
+# Cópia de trabalho do Remotion (última geração copiada aqui pra renderizar,
+# não é código-fonte — mesmo padrão do projeto uNuts)
+canal_da_fe/video/public/audio.mp3
+canal_da_fe/video/public/metadata.json
+canal_da_fe/video/public/images/
 
 # Canal Infantil (subprojeto Python)
 canal_infantil/venv/

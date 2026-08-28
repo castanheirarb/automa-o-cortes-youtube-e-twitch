@@ -35,8 +35,17 @@ function saveHistory(history) {
  * @param {string} [niche] - usado pra rastrear hashtags recentes POR NICHO
  *   (ver getRecentHashtagsForNiche) — a lista `hashtags` global continua
  *   existindo separadamente pra detecção de duplicata no post individual.
+ * @param {string|null} [persona] - nome da persona que postou (ex.: 'cariani',
+ *   'trendhunter') — usado só pra atribuição de receita por vídeo (ver
+ *   src/analytics/attribution.js), que casa este título com o vídeo real do
+ *   YouTube pra descobrir de qual persona ele é (o upload via Playwright não
+ *   retorna o videoId, então essa é a única ponte disponível).
+ * @param {string|null} [rotationMode] - qual camada de peso estava ativa no
+ *   momento do post ('baseline', 'revenue', 'subscriber', 'revenue+subscriber'
+ *   — ver poster/index.js getActiveRotationMode()). Usado só pra comparar
+ *   resultado por período em src/scheduler/compare-rotation.js.
  */
-export function recordMetadataHistory(titulo, hashtags, niche = 'default') {
+export function recordMetadataHistory(titulo, hashtags, niche = 'default', persona = null, rotationMode = null) {
     const history = loadHistory();
     if (!history.titles.includes(titulo)) history.titles.push(titulo);
     const tags = hashtags.split(/\s+/).filter(Boolean).map((t) => t.toLowerCase());
@@ -53,7 +62,25 @@ export function recordMetadataHistory(titulo, hashtags, niche = 'default') {
     history.hashtagsByNiche[niche].push(...tags);
     history.hashtagsByNiche[niche] = history.hashtagsByNiche[niche].slice(-40);
 
+    // Registro plano por post (título + persona/nicho + quando) — janela
+    // maior que `titles` (que existe pra dedup, não pra atribuição).
+    if (!history.posts) history.posts = [];
+    history.posts.push({ titulo, niche, persona, rotationMode, postedAt: new Date().toISOString() });
+    history.posts = history.posts.slice(-1500);
+
     saveHistory(history);
+}
+
+/**
+ * Posts recentes (mais novo por último) com persona/nicho/título — usado pela
+ * atribuição de receita (src/analytics/attribution.js) pra casar vídeos reais
+ * do YouTube com quem postou. Não confundir com `titles`/`hashtags` (dedup).
+ * @param {number} [limit]
+ * @returns {Array<{titulo, niche, persona, postedAt}>}
+ */
+export function getRecentPosts(limit = 300) {
+    const history = loadHistory();
+    return (history.posts ?? []).slice(-limit);
 }
 
 /**

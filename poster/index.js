@@ -57,6 +57,8 @@ import {
     formatTitle, formatYouTubeDescription, formatTikTokCaption
 } from './metadata.js';
 import { recordMetadataHistory, validateTikTokCaption, validateAndLog, sanitizeMetadata } from './metadata-validator.js';
+import { getRevenueAdjustedPersonas } from '../src/scheduler/revenue-weight.js';
+import { getSubscriberAdjustedPersonas } from '../src/scheduler/subscriber-weight.js';
 import { postExpressClip } from './express-poster.js';
 import { checkContentSafety } from './content-filter.js';
 import { getPersonaBranding } from './branding.js';
@@ -161,6 +163,18 @@ const ROTATION_PERSONAS = TREND_ENABLED ? [...MAIN_PERSONAS, TREND_ROTATION_PERS
 
 // Hotness: persona com vídeo estourando no canal-fonte fura a fila do rodízio.
 const HOTNESS_ENABLED = process.env.HOTNESS_MODE !== 'false';
+
+// Rótulo do experimento ativo no momento do post — gravado em
+// postados/metadata-history.json (ver recordMetadataHistory) pra comparação
+// posterior por período (npm run compare-rotation). Reflete só a CONFIGURAÇÃO
+// (flags no .env), não se o ajuste teve efeito de fato (amostra insuficiente
+// ainda cai em multiplicador neutro, mas o modo já fica marcado como testado).
+function getActiveRotationMode() {
+    const modes = [];
+    if (process.env.REVENUE_AWARE_ROTATION === 'true') modes.push('revenue');
+    if (process.env.SUBSCRIBER_AWARE_ROTATION === 'true') modes.push('subscriber');
+    return modes.length > 0 ? modes.join('+') : 'baseline';
+}
 
 // ─── Turno de futebol intercalado ─────────────────────────────────────────────
 // A cada lote de 3 vídeos fechado por QUALQUER persona (Casimiro incluso), o
@@ -356,6 +370,13 @@ async function runUploadCycle() {
     logger.cron(`🚀 Ciclo de upload — índice global: ${state.index} | último: ${state.lastPersona ?? 'nenhum'}`);
 
     try {
+        // Pesos ajustados por receita real e/ou conversão de inscrito — sem as
+        // flags (REVENUE_AWARE_ROTATION / SUBSCRIBER_AWARE_ROTATION), ou se
+        // qualquer etapa falhar, é a MESMA referência de ROTATION_PERSONAS
+        // (custo zero). Ver src/scheduler/revenue-weight.js e subscriber-weight.js.
+        let rotationPersonas = await getRevenueAdjustedPersonas(ROTATION_PERSONAS);
+        rotationPersonas = await getSubscriberAdjustedPersonas(rotationPersonas);
+
         // ── Nível -1: turno de futebol intercalado ────────────────────────────
         // Fica na frente de tudo (inclusive Hotness) — é uma regra estrutural
         // do rodízio ("depois de cada lote de 3, um futebol"), não uma escolha
@@ -382,7 +403,7 @@ async function runUploadCycle() {
 
         // ── Nível 0: turno do Trend Hunter com pasta vazia → captura o corte
         //    em alta dos canais concorrentes antes de selecionar a persona ─────
-        if (TREND_ENABLED && getCurrentPersona(ROTATION_PERSONAS).name === TREND_PERSONA.name
+        if (TREND_ENABLED && getCurrentPersona(rotationPersonas).name === TREND_PERSONA.name
             && !hasVideosAvailable(TREND_PERSONA)) {
             logger.step('[Poster] 🔥 Turno do Trend Hunter — vasculhando cortes em alta dos concorrentes...');
             try {
@@ -397,7 +418,7 @@ async function runUploadCycle() {
         // persona estiver acima do threshold E tiver clipes prontos na pasta.
         let hotOverride = null;
         if (FORCED_PERSONA_NAME) {
-            const forced = [...ROTATION_PERSONAS, ...DEDICATED_CHANNELS.flatMap((c) => c.rotation)]
+            const forced = [...rotationPersonas, ...DEDICATED_CHANNELS.flatMap((c) => c.rotation)]
                 .find((p) => p.name === FORCED_PERSONA_NAME);
             if (!forced) {
                 logger.error(`[Poster] --persona "${FORCED_PERSONA_NAME}" não encontrada nas personas ativas.`);
@@ -407,7 +428,7 @@ async function runUploadCycle() {
             hotOverride = { persona: forced, entry: null };
         } else if (HOTNESS_ENABLED) {
             try {
-                const candidates = ROTATION_PERSONAS.filter(
+                const candidates = rotationPersonas.filter(
                     (p) => p.name !== TREND_PERSONA.name && p.name !== CANALDAFE_PERSONA.name
                 );
                 // canPersonaPostAgain trava o furo de fila depois de POSTS_PER_PERSONA
@@ -431,7 +452,7 @@ async function runUploadCycle() {
         // ── Nível 1 + 2: Round-Robin com fallback automático ─────────────────
         let result = hotOverride
             ? { persona: hotOverride.persona, skipped: [] }
-            : getNextPersonaWithFallback(ROTATION_PERSONAS);
+            : getNextPersonaWithFallback(rotationPersonas);
 
         // ── Nível 3: Re-captação de emergência ────────────────────────────────
         if (!result) {
@@ -439,7 +460,7 @@ async function runUploadCycle() {
             try {
                 // Captura apenas a persona do turno atual (índice atual sem avançar)
                 const { index } = getQueueState();
-                const rotation = buildRotation(ROTATION_PERSONAS);
+                const rotation = buildRotation(rotationPersonas);
                 const personaToCapture = rotation[index % rotation.length];
                 if (personaToCapture.name === TREND_PERSONA.name) {
                     await captureTrendClip();
@@ -450,7 +471,7 @@ async function runUploadCycle() {
                 }
 
                 // Tenta novamente após a re-captação
-                result = getNextPersonaWithFallback(ROTATION_PERSONAS);
+                result = getNextPersonaWithFallback(rotationPersonas);
             } catch (captureErr) {
                 logger.error(`[Poster] Re-captação falhou: ${captureErr.message}`);
             }
@@ -479,7 +500,7 @@ async function runUploadCycle() {
             logger.warn(`[Poster] Pasta de "${persona.displayName}" esvaziou — buscando próxima persona...`);
             advanceQueue(persona.name);
 
-            const retry = getNextPersonaWithFallback(ROTATION_PERSONAS);
+            const retry = getNextPersonaWithFallback(rotationPersonas);
             if (!retry?.persona) {
                 logger.error('[Poster] ❌ Todas as pastas estão vazias. Rode: npm run capture');
                 return;
@@ -715,7 +736,7 @@ async function postVideoJob(activePersona, video, advance) {
             if (hasSidecar) { try { fs.unlinkSync(sidecarPath); } catch { /* ok */ } }
             // Registra no histórico de unicidade — usa só o titulo (sem hashtags embutidas)
             // para que a detecção de duplicata compare títulos iguais corretamente
-            recordMetadataHistory(metadata.titulo, metadata.hashtags || '', activePersona.niche || 'default');
+            recordMetadataHistory(metadata.titulo, metadata.hashtags || '', activePersona.niche || 'default', activePersona.name, getActiveRotationMode());
             logger.success(`[Poster] Arquivo movido para ./postados após upload bem-sucedido.`);
         } else {
             // Falha em ambas as plataformas: registra no registry para evitar loop infinite.
@@ -886,6 +907,68 @@ function printBanner() {
         console.log(`\x1b[35m      Vídeo longo (Canal da Fé): 1/dia (${LONG_VIDEO_FE_CRON}) — pasta: output/longos-fe — fonte: Bispo Bruno Leonardo\x1b[0m`);
     }
     console.log('\x1b[35m' + '═'.repeat(58) + '\x1b[0m\n');
+}
+
+// ─── Watchdog de horário perdido (round-robin normal) ─────────────────────────
+// O node-cron roda no MESMO processo/thread do resto do poster. Se o event
+// loop travar por alguns segundos bem no instante exato do disparo (ex.: pausa
+// de garbage collection sob pressão de memória), o node-cron detecta e PULA
+// aquele horário sem tentar de novo — log real observado em produção:
+// "missed execution at ... Possible blocking IO or high CPU". Diferente do
+// vídeo longo (recuperação só na inicialização, cobre reinício do processo),
+// esse caso acontece com o processo já rodando há dias sem reiniciar — por
+// isso aqui é um watchdog PERIÓDICO (setInterval), não só um check no boot.
+const MISSED_SLOT_GRACE_MIN = 20; // tolerância antes de considerar "perdido" (cobre ciclo só lento)
+const MISSED_SLOT_CHECK_MS = 10 * 60 * 1000; // checa a cada 10min
+
+function minutesOfDay(hour, min) {
+    return parseInt(hour, 10) * 60 + parseInt(min, 10);
+}
+
+/** Horário (em minutos do dia) do slot mais recente que já deveria ter disparado hoje. */
+function mostRecentPassedSlotMinutes(cronExprs, nowMinutes) {
+    let best = null;
+    for (const expr of cronExprs) {
+        const [min, hour] = expr.split(' ');
+        const slotMin = minutesOfDay(hour, min);
+        if (!Number.isFinite(slotMin)) continue;
+        if (slotMin <= nowMinutes && (best === null || slotMin > best)) best = slotMin;
+    }
+    return best;
+}
+
+function startMissedSlotWatchdog() {
+    setInterval(() => {
+        try {
+            if (isUploading) return; // ciclo rodando agora — provavelmente o próprio disparo, só atrasado
+
+            const agora = new Date(new Date().toLocaleString('en-US', { timeZone: TIMEZONE }));
+            const nowMinutes = agora.getHours() * 60 + agora.getMinutes();
+            const slotMin = mostRecentPassedSlotMinutes(ACTIVE_SLOTS, nowMinutes);
+            if (slotMin === null) return; // nenhum horário passou ainda hoje
+
+            if (nowMinutes - slotMin < MISSED_SLOT_GRACE_MIN) return; // dentro da tolerância — pode só estar demorando
+
+            const state = getQueueState();
+            const lastPostKey = state.lastPost
+                ? new Date(state.lastPost).toLocaleDateString('en-CA', { timeZone: TIMEZONE })
+                : null;
+            const lastPostMinutes = lastPostKey === todayKey()
+                ? (() => { const d = new Date(new Date(state.lastPost).toLocaleString('en-US', { timeZone: TIMEZONE })); return d.getHours() * 60 + d.getMinutes(); })()
+                : -1;
+
+            if (lastPostMinutes >= slotMin) return; // já postou nesse horário (ou depois) — nada perdido
+
+            const hh = String(Math.floor(slotMin / 60)).padStart(2, '0');
+            const mm = String(slotMin % 60).padStart(2, '0');
+            logger.warn(`[Poster] ⏰ Horário das ${hh}h${mm} parece ter sido perdido (node-cron travou?) — recuperando agora...`);
+            runUploadCycle()
+                .then(() => runDedicatedChannelCycles())
+                .catch((err) => logger.error(`[Poster] Recuperação de horário perdido falhou: ${err.message}`));
+        } catch (err) {
+            logger.warn(`[Poster] Watchdog de horário perdido falhou: ${err.message}`);
+        }
+    }, MISSED_SLOT_CHECK_MS);
 }
 
 // ─── Inicialização ────────────────────────────────────────────────────────────
@@ -1103,6 +1186,11 @@ async function main() {
 
     if (LONG_VIDEO_ENABLED) recoverMissedLongVideo(MAIN_LONG_CFG, LONG_VIDEO_CRON);
     if (LONG_VIDEO_FE_ENABLED) recoverMissedLongVideo(FE_LONG_CFG, LONG_VIDEO_FE_CRON);
+
+    // Vídeo longo só recupera no boot (cobre reinício). O round-robin normal
+    // roda dias sem reiniciar, então precisa de um watchdog contínuo — ver
+    // comentário em startMissedSlotWatchdog().
+    startMissedSlotWatchdog();
 
     logger.info(`Auto-poster aguardando os ${registered} horários agendados. Ctrl+C para encerrar.\n`);
 }

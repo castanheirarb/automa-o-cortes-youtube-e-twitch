@@ -20,7 +20,17 @@ import { logger } from './logger.js';
 
 const REDIRECT_PORT = parseInt(process.env.YOUTUBE_OAUTH_REDIRECT_PORT || '51739', 10);
 const REDIRECT_URI = `http://localhost:${REDIRECT_PORT}/oauth2callback`;
-const SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl'];
+// force-ssl: ler/responder comentários (Comment Bot).
+// yt-analytics(.-monetary).readonly: receita/views por vídeo (Revenue-Aware
+// Rotation, ver src/scheduler/revenue-weight.js) — escopo "restrito" do
+// Google; como o app está em modo Testing com contas de teste explícitas,
+// funciona sem verificação, mas pode mostrar um aviso extra de "app não
+// verificado" na tela de consentimento.
+const SCOPES = [
+    'https://www.googleapis.com/auth/youtube.force-ssl',
+    'https://www.googleapis.com/auth/yt-analytics.readonly',
+    'https://www.googleapis.com/auth/yt-analytics-monetary.readonly',
+];
 
 function parseChannelArg() {
     const args = process.argv.slice(2);

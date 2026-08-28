@@ -19,6 +19,7 @@ import crypto from 'node:crypto';
 import { logger } from '../utils/logger.js';
 import { sanitizeFilename, formatDuration } from '../utils/helpers.js';
 import { addCaptionsToClip } from './captions.js';
+import { isolateVocals, shouldIsolateVocals } from './vocal-isolate.js';
 import { detectCropXPosition, detectSceneLayout } from './face-detect.js';
 import { findSmartEndTime } from './smart-boundary.js';
 
@@ -946,6 +947,8 @@ export async function processClip(peakData, clipIndex = 1, totalClips = 1) {
                     throw new Error('Clipe idêntico a outro já gerado desta fonte — descartado.');
                 }
                 if (!skipCaptions) await addCaptionsToClip(outputPath, { niche, layout });
+                if (shouldIsolateVocals(niche)) await isolateVocals(outputPath);
+                await warnIfMostlyDark(outputPath, clipDurationSec);
                 logger.success(`Clipe ${clipIndex}/${totalClips} salvo: ${filename}`);
                 return outputPath;
             }
@@ -1005,6 +1008,8 @@ export async function processClip(peakData, clipIndex = 1, totalClips = 1) {
     // skipCaptions: fontes que já têm legenda queimada (ex.: cortes de
     // concorrentes via Trend Hunter) não recebem uma segunda camada.
     if (!skipCaptions) await addCaptionsToClip(outputPath, { niche, layout });
+    if (shouldIsolateVocals(niche)) await isolateVocals(outputPath);
+    await warnIfMostlyDark(outputPath, clipDurationSec);
 
     logger.success(`Clipe ${clipIndex}/${totalClips} salvo: ${filename}`);
     return outputPath;
@@ -1013,6 +1018,42 @@ export async function processClip(peakData, clipIndex = 1, totalClips = 1) {
 /**
  * Apaga e rejeita o clipe se a duração REAL do arquivo ficar abaixo do mínimo.
  */
+/**
+ * Diagnóstico não-bloqueante: roda o blackdetect do FFmpeg e loga um aviso se
+ * uma fração grande do clipe ficou praticamente preta (cena sem nada visível
+ * — ex.: pico caiu num trecho de jogo escuro sem luz, ou numa transição/
+ * cutaway sem ninguém em quadro). NÃO descarta o clipe — decidir se um trecho
+ * escuro é "de propósito" (jogo de terror) ou "morto" (nada acontecendo) é
+ * uma decisão de conteúdo, não técnica; isso só torna o problema visível nos
+ * logs pra revisão manual, em vez de passar batido.
+ */
+async function warnIfMostlyDark(outputPath, clipDurationSec) {
+    try {
+        const ffmpegBin = process.env.FFMPEG_PATH?.trim() || 'ffmpeg';
+        let stderr = '';
+        try {
+            const res = await execFileAsync(ffmpegBin, [
+                '-i', outputPath,
+                '-vf', 'blackdetect=d=0.5:pic_th=0.98',
+                '-an', '-f', 'null', '-',
+            ], { maxBuffer: 10 * 1024 * 1024 });
+            stderr = res.stderr || '';
+        } catch (err) {
+            stderr = err.stderr || ''; // ffmpeg -f null costuma sair 0, mas usa o stderr mesmo se não
+        }
+
+        const durations = [...stderr.matchAll(/black_duration:([\d.]+)/g)].map((m) => parseFloat(m[1]));
+        const totalBlack = durations.reduce((s, d) => s + d, 0);
+
+        if (clipDurationSec > 0 && totalBlack / clipDurationSec > 0.4) {
+            const pct = Math.round((totalBlack / clipDurationSec) * 100);
+            logger.warn(`[FFmpeg] ⚠️ Clipe com ~${pct}% do tempo em tela praticamente preta (${path.basename(outputPath)}) — pico pode ter caído numa cena sem conteúdo visível. Revisão manual recomendada.`);
+        }
+    } catch (err) {
+        logger.warn(`[FFmpeg] Checagem de brilho falhou (${err.message}) — ignorando.`);
+    }
+}
+
 async function discardIfTooShort(outputPath, minClipSec) {
     const real = await probeVideoDuration(outputPath).catch(() => null);
     if (real !== null && real < minClipSec) {

@@ -1,0 +1,19 @@
+# ── Pipeline de geração ───────────────────────────────────────────────────────
+anthropic
+google-generativeai
+groq
+replicate
+edge-tts
+requests
+python-dotenv
+rich
+mutagen
+pillow
+
+# ── YouTube Data API v3 (OAuth 2.0 oficial) ──────────────────────────────────
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+
+# ── TikTok (upload via cookies de sessão) ────────────────────────────────────
+tiktok-uploader

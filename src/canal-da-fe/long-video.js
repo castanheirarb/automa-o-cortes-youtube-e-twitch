@@ -23,6 +23,7 @@ import path from 'node:path';
 import { logger } from '../utils/logger.js';
 import { fetchYouTubeVideoList } from '../capturer/fetcher.js';
 import { sanitizeFilename } from '../utils/helpers.js';
+import { isolateVocals } from '../processor/vocal-isolate.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -97,6 +98,11 @@ export async function getBispoLongVideo({ maxAttempts = 3, listSize = 15 } = {})
         const destPath = path.join(LONG_FE_DIR, `${sanitizeFilename(video.title)}.mp4`);
         try {
             await downloadFullVideo(video, destPath);
+            // Mitigação do copyright strike de 2026-08-24 (Soares Music
+            // Digital): remove música de fundo antes de entrar na fila de
+            // postagem. Nunca lança — sem Demucs configurado, segue com o
+            // áudio original (ver src/processor/vocal-isolate.js).
+            await isolateVocals(destPath);
             logger.success(`[LongVideoFé] Vídeo longo pronto: ${path.basename(destPath)}`);
             return destPath;
         } catch (err) {

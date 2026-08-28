@@ -53,6 +53,13 @@ export const PERSONAS = [
     },
 
     // ── Canal religioso (posta no perfil dedicado chrome-youtube-02) ────────
+    // Reativado (2026-08-25): só os CORTES CURTOS voltam — o vídeo longo
+    // segue pausado de propósito (LONG_VIDEO_FE_ENABLED=false no .env), já
+    // que foi ele que tomou o copyright strike da Soares Music Digital em
+    // 2026-08-24 (ver histórico). Mitigação de música de fundo (isolamento
+    // de voz via Demucs, src/processor/vocal-isolate.js) já entra sozinha
+    // pra esse nicho — testada com GPU nos vídeos reais que tomaram strike
+    // antes desta reativação.
     {
         name: 'bispobrunoleonardo',
         displayName: 'Bispo Bruno Leonardo',
@@ -62,35 +69,8 @@ export const PERSONAS = [
         videoOffset: 1,
         niche: 'religioso',
         weight: 1,
-        // Roteamento: cortes desta persona vão SOMENTE para o canal religioso
-        // (YouTube) e a conta de TikTok dedicada do Canal da Fé — nunca para a
-        // conta principal. Perfis criados via:
-        //   node poster/login.js --platform youtube --profile ./profiles/chrome-youtube-02
-        //   node poster/login.js --platform tiktok   --profile ./profiles/chrome-tiktok-02
         youtubeProfileDir: './profiles/chrome-youtube-02',
         tiktokProfileDir: './profiles/chrome-tiktok-02',
-        // Lives de oração não geram "Most Replayed" — usa picos uniformes
-        uniformPeaksFallback: true,
-    },
-
-    // ── Canal infantil (posta no perfil dedicado chrome-youtube-03) ─────────
-    {
-        name: 'lucasneto',
-        displayName: 'Luccas Neto',
-        platform: 'youtube',
-        channelUrl: 'https://www.youtube.com/@luccasneto/videos',
-        clipsPerRun: 5,
-        videoOffset: 1,
-        niche: 'infantil',
-        weight: 1,
-        // Roteamento: cortes desta persona vão SOMENTE para o canal infantil
-        // (mesmo perfil do Canal Infantil gerado por IA) — nunca para a conta
-        // principal. Perfil criado via:
-        //   node poster/login.js --platform youtube --profile ./profiles/chrome-youtube-03
-        youtubeProfileDir: process.env.CANALINFANTIL_PROFILE || './profiles/chrome-youtube-03',
-        skipTikTok: true, // Canal Infantil não posta no TikTok (mesma regra do vídeo gerado)
-        // Conteúdo infantil — declaração obrigatória (COPPA) na etapa de upload.
-        madeForKids: true,
         uniformPeaksFallback: true,
     },
 
@@ -131,6 +111,12 @@ export const PERSONAS = [
     },
 
     // ── Desativadas (re-ative movendo de volta para cima) ────────────────────
+    // Canal infantil pausado (2026-08-22): posts desligados enquanto um novo
+    // canal é planejado — capturar cortes do Luccas Neto sem destino gera
+    // trabalho/API à toa, por isso a persona sai da lista ativa (não só do
+    // rodízio do poster). Ver também CANALINFANTIL_IN_ROTATION=false no .env
+    // (geração por IA do Canal Infantil, já pausada antes por outro motivo).
+    // { name: 'lucasneto', displayName: 'Luccas Neto', platform: 'youtube', channelUrl: 'https://www.youtube.com/@luccasneto/videos', clipsPerRun: 5, videoOffset: 1, niche: 'infantil', weight: 1, youtubeProfileDir: process.env.CANALINFANTIL_PROFILE || './profiles/chrome-youtube-03', skipTikTok: true, madeForKids: true, uniformPeaksFallback: true },
     // { name: 'fontinele', displayName: 'Fontinele', platform: 'youtube', channelUrl: 'https://www.youtube.com/@OFontinele/videos', clipsPerRun: 5, videoOffset: 2, niche: 'podcast' },
     // { name: 'lubatv', displayName: 'LubaTV', platform: 'youtube', channelUrl: 'https://www.youtube.com/@LubaTV/videos', clipsPerRun: 5, videoOffset: 2, niche: 'react' },
     // { name: 'brino', displayName: 'Brino (BruninZor)', platform: 'twitch', channelUrl: 'bruninzor', youtubeUrl: null, clipsPerRun: 5, niche: 'gaming' },

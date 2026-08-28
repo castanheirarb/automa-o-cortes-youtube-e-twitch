@@ -95,7 +95,7 @@ function extractAudio(videoPath) {
 
 // ─── 2. Transcrição com Groq Whisper (timestamps por segmento E por palavra) ──
 
-async function transcribeWithTimestamps(audioPath) {
+export async function transcribeWithTimestamps(audioPath) {
     const apiKey = process.env.GROQ_API_KEY?.trim();
     if (!apiKey) throw new Error('GROQ_API_KEY não configurada no .env');
 
@@ -122,11 +122,29 @@ function sanitizeWord(word) {
     return clean || word; // nunca deixa a palavra sumir (quebraria o karaokê)
 }
 
+// ─── 3b. Sanidade dos timestamps do Whisper ───────────────────────────────────
+// Em áudio ruidoso (torcida/narração de transmissão esportiva, múltiplas vozes
+// sobrepostas), o Whisper às vezes devolve uma "palavra" com duração absurda
+// (start/end cobrindo quase o clipe inteiro) — um artefato de transcrição, não
+// uma palavra real de 10-30s. Isso travava a legenda visível do início ao fim
+// do vídeo (bug real observado em cortes de futebol: mesma legenda estática
+// o clipe inteiro). Nenhuma palavra falada dura mais que ~2s; descarta o que
+// exceder isso ANTES de agrupar em linhas — line[0].start/line[-1].end nunca
+// mais herdam um timestamp contaminado.
+const MAX_WORD_DURATION_SEC = 2;
+
+export function filterReliableWords(words) {
+    return words.filter((w) => {
+        const dur = w.end - w.start;
+        return dur > 0 && dur <= MAX_WORD_DURATION_SEC;
+    });
+}
+
 // ─── 4. Agrupa palavras em linhas curtas (ritmo viral) ────────────────────────
 // Mesmo ritmo de antes (~3 palavras/linha), mas agora baseado nos timestamps
 // reais de PALAVRA do Whisper — quebra também numa pausa grande (>0.6s),
 // pra não colar duas frases sem relação na mesma linha.
-function groupWordsIntoLines(words, maxWordsPerLine = 3, maxGapSec = 0.6) {
+export function groupWordsIntoLines(words, maxWordsPerLine = 3, maxGapSec = 0.6) {
     const lines = [];
     let current = [];
 
@@ -175,12 +193,28 @@ function buildKaraokeLine(lineWords) {
     return text.trim();
 }
 
+// Rede de segurança final contra timestamp contaminado: mesmo já filtrando
+// palavras individuais suspeitas (filterReliableWords), nada garante que o
+// Whisper não devolva um SEGMENTO inteiro com duração absurda no mesmo tipo
+// de áudio ruidoso. Nenhuma linha de karaokê (≤3 palavras) precisa de mais de
+// alguns segundos na tela; um segmento (pode agrupar várias frases) recebe
+// uma folga maior, mas ainda limitada — sem isso, um timestamp errado deixa
+// a legenda "grudada" na tela pelo resto do clipe.
+const MAX_LINE_DURATION_SEC = 6;
+const MAX_SEGMENT_DURATION_SEC = 12;
+
+function clampEnd(startSec, endSec, maxDurationSec) {
+    return Math.min(endSec, startSec + maxDurationSec);
+}
+
 function buildAssFromWords(words, style, marginV) {
     const lines = groupWordsIntoLines(words);
     let events = '';
     for (const line of lines) {
-        const start = toAssTime(line[0].start);
-        const end = toAssTime(line[line.length - 1].end);
+        const startSec = line[0].start;
+        const endSec = clampEnd(startSec, line[line.length - 1].end, MAX_LINE_DURATION_SEC);
+        const start = toAssTime(startSec);
+        const end = toAssTime(endSec);
         const text = buildKaraokeLine(line);
         events += `Dialogue: 0,${start},${end},Default,,0,0,0,,${text}\n`;
     }
@@ -194,8 +228,10 @@ function buildAssFromSegments(segments, style, marginV) {
         const words = seg.text.trim().split(/\s+/).filter(Boolean).map(sanitizeWord);
         const chunks = [];
         for (let i = 0; i < words.length; i += 3) chunks.push(words.slice(i, i + 3).join(' '));
-        const start = toAssTime(seg.start);
-        const end = toAssTime(seg.end);
+        const startSec = seg.start;
+        const endSec = clampEnd(startSec, seg.end, MAX_SEGMENT_DURATION_SEC);
+        const start = toAssTime(startSec);
+        const end = toAssTime(endSec);
         const text = chunks.join('\\N'); // \N = quebra de linha dentro do mesmo evento ASS
         events += `Dialogue: 0,${start},${end},Default,,0,0,0,,${text}\n`;
     }
@@ -261,12 +297,17 @@ export async function addCaptionsToClip(videoPath, { niche = 'default', layout =
             return videoPath;
         }
 
+        const reliableWords = filterReliableWords(words);
+        if (words.length > 0 && reliableWords.length < words.length) {
+            logger.warn(`[Captions] ${words.length - reliableWords.length}/${words.length} palavra(s) com timestamp implausível (áudio ruidoso?) — descartadas.`);
+        }
+
         let assContent;
-        if (words.length > 0) {
-            logger.info(`[Captions] ${words.length} palavra(s) com timestamp — destaque sincronizado ativado (nicho: ${niche}).`);
-            assContent = buildAssFromWords(words, style, marginV);
+        if (reliableWords.length > 0) {
+            logger.info(`[Captions] ${reliableWords.length} palavra(s) com timestamp — destaque sincronizado ativado (nicho: ${niche}).`);
+            assContent = buildAssFromWords(reliableWords, style, marginV);
         } else {
-            logger.info(`[Captions] Sem timestamp por palavra — usando linhas estáticas por segmento (${segments.length} segmento(s)).`);
+            logger.info(`[Captions] Sem timestamp por palavra confiável — usando linhas estáticas por segmento (${segments.length} segmento(s)).`);
             assContent = buildAssFromSegments(segments, style, marginV);
         }
 

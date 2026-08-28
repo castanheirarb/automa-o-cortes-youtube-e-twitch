@@ -25,11 +25,13 @@ export class YouTubeAuthError extends Error {
 }
 
 /**
- * Monta o cliente autenticado da YouTube Data API pra um canal.
+ * Monta o client OAuth2 cru pra um canal — reaproveitável por QUALQUER API do
+ * Google que aceite esse token (Data API v3 aqui, Analytics API v2 em
+ * src/analytics/*), não só o Comment Bot.
  * @param {{key: string, refreshTokenEnv: string}} channelConfig
- * @returns {import('googleapis').youtube_v3.Youtube}
+ * @returns {import('googleapis').Auth.OAuth2Client}
  */
-export function getYouTubeClient(channelConfig) {
+export function getOAuth2Client(channelConfig) {
     const clientId = process.env.YOUTUBE_CLIENT_ID?.trim();
     const clientSecret = process.env.YOUTUBE_CLIENT_SECRET?.trim();
     const refreshToken = process.env[channelConfig.refreshTokenEnv]?.trim();
@@ -59,7 +61,16 @@ export function getYouTubeClient(channelConfig) {
         }
     });
 
-    return google.youtube({ version: 'v3', auth: oauth2Client });
+    return oauth2Client;
+}
+
+/**
+ * Monta o cliente autenticado da YouTube Data API pra um canal.
+ * @param {{key: string, refreshTokenEnv: string}} channelConfig
+ * @returns {import('googleapis').youtube_v3.Youtube}
+ */
+export function getYouTubeClient(channelConfig) {
+    return google.youtube({ version: 'v3', auth: getOAuth2Client(channelConfig) });
 }
 
 const channelIdCache = new Map(); // key: channelConfig.key -> channelId (cache em memória do processo)
