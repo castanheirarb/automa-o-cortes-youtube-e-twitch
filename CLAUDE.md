@@ -9,12 +9,16 @@ Automação completa de 3 canais do YouTube (+ TikTok) rodando na máquina Windo
 
 1. **Canal principal** ("Corte Certo 034") — cortes de lives/VODs de 6 "personas" (streamers/criadores
    de YouTube e Twitch), escolhidos automaticamente pelo momento de maior audiência (heatmap/chat).
-2. **Canal da Fé** — canal religioso dedicado (Bispo Bruno Leonardo): cortes do próprio canal dele +
-   vídeos gerados por IA (roteiro + FLUX + narração + Remotion, pipeline Python em `canal_da_fe/`).
-   O canal original morreu (strikes de copyright — ver histórico de memória
-   `project_canal_da_fe_copyright_strike`); o canal ativo hoje é **A Fé Move Montanhas** (mesma
-   persona `bispobrunoleonardo`, conta/perfil novos), já com volume real de inscritos e views. Vídeo
-   longo dedicado segue pausado (`LONG_VIDEO_FE_ENABLED`) até decisão de fonte de conteúdo.
+2. **A Fé Move Montanhas** — canal religioso dedicado, nome atual (o canal original, "Canal da Fé",
+   morreu de strikes de copyright — ver memória `project_canal_da_fe_copyright_strike`; "Canal da
+   Fé"/`FE` sobrevive só como slug técnico interno: pastas `canal_da_fe/`, `src/canal-da-fe/`, env
+   vars `LONG_VIDEO_FE_*`, persona `bispobrunoleonardo` — não é o nome do canal, não use como tal).
+   Shorts: cortes do próprio Bispo Bruno Leonardo, já com volume real de inscritos e views. Vídeo
+   longo diário: reativado em 19/09/2026 com fonte NOVA — não mais o canal do Bispo (que gerou o
+   strike original), e sim lives de oração de canais terceiros (`PRAYER_LIVE_CHANNELS` em
+   `src/canal-da-fe/long-video.js`, base de permissão = interpretação de fair use, não autorização
+   por escrito — risco residual real). Também existe pipeline de geração por IA (roteiro + FLUX +
+   narração + Remotion, Python em `canal_da_fe/`), ainda não ativado.
 3. **Canal Infantil** — Shorts educativos infantis: cortes do Luccas Neto + vídeos gerados por IA
    (roteiro Groq + Pexels + Edge-TTS + FFmpeg, pipeline Python em `canal_infantil/`). Cortes ativos
    desde 19/09/2026 (conta `ferfertanus@hotmail.com`, suspensa em 07/09, teve o acesso confirmado de
