@@ -17,7 +17,17 @@
 //   2. Tenta as demais personas em sequência (skipping vazias)
 //   3. Dispara re-captação automática da persona original (emergência)
 
-import 'dotenv/config';
+// { override: true } é obrigatório aqui: este processo é respawnado pelo
+// watchdog do start.js, que passa env: { ...process.env } (snapshot herdado,
+// não uma leitura nova do disco). O comportamento padrão do dotenv NUNCA
+// sobrescreve uma chave que já existe em process.env — então, sem override,
+// uma variável do .env editada DEPOIS do start.js ter subido (ex.:
+// UPLOAD_TO_INSTAGRAM) fica presa no valor antigo pra sempre, mesmo depois de
+// matar e deixar o watchdog reiniciar este processo. Confirmado na prática em
+// 2026-09-15: UPLOAD_TO_INSTAGRAM=false no .env, mas o processo recém-reiniciado
+// ainda tratou Instagram como ligado (instagram-registry ganhou entradas novas).
+import { config as loadDotenv } from 'dotenv';
+loadDotenv({ override: true });
 import fs from 'node:fs';
 import path from 'node:path';
 import cron from 'node-cron';
@@ -27,7 +37,8 @@ import {
     getNextPersonaWithFallback, advanceQueue as advanceQueueState,
     getPersonaOutputDir, getQueueState,
     getCurrentPersona, hasVideosAvailable, buildRotation, canPersonaPostAgain,
-    FOOTBALL_TURN_NAME, isFootballTurnPending
+    FOOTBALL_TURN_NAME, isFootballTurnPending,
+    TIKTOK_LIVE_TURN_NAME, isTikTokLiveTurnPending
 } from '../src/scheduler/round-robin.js';
 import { addNotificationPopup, resolveChannelBranding } from '../src/processor/notification-overlay.js';
 
@@ -39,24 +50,30 @@ const advanceQueue = (name) => { if (!FORCED_PERSONA_NAME) advanceQueueState(nam
 import { capturePersona } from '../src/capturer/capturer.js';
 import { pickHotPersona } from '../src/scheduler/hotness.js';
 import { TREND_PERSONA, captureTrendClip } from '../src/trend-hunter/trend-capture.js';
+import { GTA6_PERSONA, captureGta6TrendClip } from '../src/trend-hunter/gta6-capture.js';
 import { CANALDAFE_PERSONA, generateCanalDaFeVideo } from '../src/canal-da-fe/generate.js';
 import { CANALINFANTIL_PERSONA, generateCanalInfantilVideo } from '../src/canal-infantil/generate.js';
 import { initBinaries, probeVideoDuration } from '../src/processor/ffmpeg.js';
+import { validateAllSessions } from './session-check.js';
+import { msUntilNextAllowed, recordUploadAttempt, logThrottled } from './upload-pacing.js';
+import { enqueueRepost } from '../bilibili/repost-queue.js';
 
 import {
     getNextVideoFromPersona, markAsPosted,
     registerAsPosted, ensureDirs,
     isTikTokPosted, registerTikTokPosted,
     isYouTubePosted, registerYouTubePosted,
+    isInstagramPosted, registerInstagramPosted,
     isContentPosted, registerContentPosted,
 } from './queue.js';
 import { uploadToYouTube } from './uploaders/youtube.js';
 import { uploadToTikTok } from './uploaders/tiktok.js';
+import { uploadToInstagram } from './uploaders/instagram.js';
 import {
     generateMetadata, generateFallbackMetadata,
-    formatTitle, formatYouTubeDescription, formatTikTokCaption
+    formatTitle, formatYouTubeDescription, formatTikTokCaption, formatInstagramCaption
 } from './metadata.js';
-import { recordMetadataHistory, validateTikTokCaption, validateAndLog, sanitizeMetadata } from './metadata-validator.js';
+import { recordMetadataHistory, validateTikTokCaption, validateInstagramCaption, validateAndLog, sanitizeMetadata } from './metadata-validator.js';
 import { getRevenueAdjustedPersonas } from '../src/scheduler/revenue-weight.js';
 import { getSubscriberAdjustedPersonas } from '../src/scheduler/subscriber-weight.js';
 import { postExpressClip } from './express-poster.js';
@@ -72,12 +89,15 @@ const HEADLESS = process.env.HEADLESS !== 'false';
 
 const TIKTOK_ONLY = process.argv.includes('--tiktok-only');
 const YOUTUBE_ONLY = process.argv.includes('--youtube-only');
+const INSTAGRAM_ONLY = process.argv.includes('--instagram-only');
 
-const UPLOAD_YOUTUBE = !TIKTOK_ONLY && process.env.UPLOAD_TO_YOUTUBE !== 'false';
-const UPLOAD_TIKTOK = !YOUTUBE_ONLY && process.env.UPLOAD_TO_TIKTOK !== 'false';
+const UPLOAD_YOUTUBE = !TIKTOK_ONLY && !INSTAGRAM_ONLY && process.env.UPLOAD_TO_YOUTUBE !== 'false';
+const UPLOAD_TIKTOK = !YOUTUBE_ONLY && !INSTAGRAM_ONLY && process.env.UPLOAD_TO_TIKTOK !== 'false';
+const UPLOAD_INSTAGRAM = !YOUTUBE_ONLY && !TIKTOK_ONLY && process.env.UPLOAD_TO_INSTAGRAM !== 'false';
 
 if (TIKTOK_ONLY) console.log('\x1b[36m  🎵 Modo TikTok-only ativado\x1b[0m');
 if (YOUTUBE_ONLY) console.log('\x1b[31m  📺 Modo YouTube-only ativado\x1b[0m');
+if (INSTAGRAM_ONLY) console.log('\x1b[35m  📸 Modo Instagram-only ativado\x1b[0m');
 
 // 4 slots cron padrão: 11h, 15h, 19h, 23h (horário de Brasília)
 // Cada slot pode ser sobreposto via .env individualmente.
@@ -145,12 +165,51 @@ const INFANTIL_ROTATION = INFANTIL_SOURCES.length === 1
     ? [INFANTIL_SOURCES[0]]
     : buildRotation(INFANTIL_SOURCES);
 
+// Canal GTA VI: pré-lançamento (jogo sai 19/11/2026), só existe o Trend Hunter
+// (src/trend-hunter/gta6-capture.js) minerando análise/reação de canais BR —
+// ninguém está jogando ao vivo ainda, então não há persona de streamer pra
+// clipar. Fonte única por enquanto (sem buildRotation ponderado, ao contrário
+// do religioso/infantil, que já intercalam 2 fontes).
+// Quando o jogo lançar e streamers BR de GTA RP (Coringa, PaulinhoLOKObr,
+// LuquEt4, Gabepeixe, Cellbit) começarem a jogar de verdade, é aqui que entram
+// personas reais (platform: 'twitch', niche: 'gta6') ponderadas via
+// buildRotation, no mesmo padrão de RELIGIOUS_SOURCES/INFANTIL_SOURCES acima.
+const GTA6_ENABLED = process.env.GTA6_IN_ROTATION !== 'false';
+const GTA6_ROTATION = GTA6_ENABLED ? [GTA6_PERSONA] : [];
+
 // Canais dedicados: cada um posta em TODOS os slots do cron, logo após a conta
 // principal, com fila própria. Adicionar um canal novo = mais uma entrada aqui.
 const DEDICATED_CHANNELS = [
     { id: 'religioso', label: 'Canal religioso', stateFile: './scheduler/religioso-state.json', rotation: RELIGIOUS_ROTATION },
     { id: 'infantil',  label: 'Canal infantil',  stateFile: './scheduler/infantil-state.json',  rotation: INFANTIL_ROTATION },
+    { id: 'gta6',      label: 'Canal GTA VI',    stateFile: './scheduler/gta6-state.json',      rotation: GTA6_ROTATION },
 ].filter((c) => c.rotation.length > 0);
+
+// ─── Repost pro Bilibili mainland (pedido do usuário, 17/09/2026) ─────────────
+// cortecerto034 (rodízio principal) e Fé Move Montanha (religioso) alimentam a
+// fila de repost do Bilibili (ver bilibili/repost-queue.js) a cada post
+// bem-sucedido — GTA VI FICA DE FORA de propósito: é Trend Hunter dinâmico,
+// sem uma URL de origem estável por clipe hoje (ver comentário em
+// repost-queue.js). Nome de cada persona → Set pra checagem O(1) no hook.
+const BILIBILI_REPOST_ELIGIBLE = new Set([
+    ...MAIN_PERSONAS.map((p) => p.name),
+    ...RELIGIOUS_ROTATION.map((p) => p.name),
+]);
+const BILIBILI_REPOST_ENABLED = process.env.BILIBILI_REPOST_ENABLED !== 'false';
+
+// Constrói a URL de origem do canal pra citar como fonte no repost (compliance
+// 转载) — aproximada por CANAL, não por vídeo exato (não há hoje um jeito
+// barato de saber qual VOD/live específico virou este clipe depois que ele já
+// está pronto em ./output, ver mesmo comentário acima). channelUrl já vem
+// como URL completa pras personas YouTube; Twitch/TikTok guardam só o
+// handle — monta a URL a partir da plataforma.
+function getPersonaSourceUrl(persona) {
+    if (!persona?.channelUrl) return null;
+    if (/^https?:\/\//i.test(persona.channelUrl)) return persona.channelUrl;
+    if (persona.platform === 'twitch') return `https://www.twitch.tv/${persona.channelUrl}`;
+    if (persona.platform === 'tiktok') return `https://www.tiktok.com/@${persona.channelUrl}`;
+    return null; // plataforma não mapeada — não adivinha URL (sourceUrl é obrigatório pro Bilibili)
+}
 
 // Trend Hunter deve ser o mais postado: metade dos turnos (4 posts/dia → 2 dele).
 // Peso = soma dos pesos das demais personas, salvo TREND_WEIGHT explícito no .env.
@@ -192,6 +251,27 @@ function pickFootballSource() {
     return null;
 }
 
+// ─── Turno diário de TikTok Live (conta principal) ────────────────────────────
+// Cortes das lives de TikTok monitoradas (personas platform:'tiktok' em
+// personas.js) — pedido do usuário em 07/09/2026 pra garantir pelo menos 1
+// post/dia na conta principal, já que o peso delas no rodízio grande sozinho
+// levaria mais de uma semana pra dar a volta (ver isTikTokLiveTurnPending).
+// Escolha ponderada pelo campo `weight` de cada uma, só entre as que têm
+// clipe pronto agora.
+const TIKTOK_LIVE_PERSONAS = PERSONAS.filter((p) => p.platform === 'tiktok');
+
+function pickTikTokLiveSource() {
+    const candidates = TIKTOK_LIVE_PERSONAS.filter((p) => hasVideosAvailable(p));
+    if (candidates.length === 0) return null;
+    const totalWeight = candidates.reduce((sum, p) => sum + (p.weight ?? 1), 0);
+    let r = Math.random() * totalWeight;
+    for (const p of candidates) {
+        r -= (p.weight ?? 1);
+        if (r <= 0) return p;
+    }
+    return candidates[candidates.length - 1];
+}
+
 // ─── Vídeo Longo Diário ───────────────────────────────────────────────────────
 // 1 vídeo longo por dia, publicado via express-poster (que já gera metadados
 // sem #shorts para vídeos longos). Coloque os .mp4 em ./output/longos.
@@ -213,6 +293,23 @@ const LONG_VIDEOS_FE_DIR = path.resolve(process.env.LONG_VIDEOS_FE_DIR || './out
 // upload ao mesmo tempo (o upload-lock já serializa, isso só espalha a carga).
 const LONG_VIDEO_FE_CRON = process.env.CRON_VIDEO_LONGO_FE || '30 20 * * *';
 const LONG_STATE_FE_PATH = path.resolve('./postados/long-video-fe-state.json');
+
+// Vídeo longo diário do CANAL INFANTIL: mesma mecânica, fonte sempre o canal
+// oficial do Luccas Neto (ver src/canal-infantil/long-video.js). Desative com
+// LONG_VIDEO_INFANTIL_ENABLED=false.
+const LONG_VIDEO_INFANTIL_ENABLED = process.env.LONG_VIDEO_INFANTIL_ENABLED !== 'false' && !!LUCASNETO_PERSONA;
+const LONG_VIDEOS_INFANTIL_DIR = path.resolve(process.env.LONG_VIDEOS_INFANTIL_DIR || './output/longos-infantil');
+// 1h depois do vídeo longo principal — mesmo espaçamento anti-disputa de upload-lock.
+const LONG_VIDEO_INFANTIL_CRON = process.env.CRON_VIDEO_LONGO_INFANTIL || '0 21 * * *';
+const LONG_STATE_INFANTIL_PATH = path.resolve('./postados/long-video-infantil-state.json');
+
+// Vídeo longo diário do GTA VI: fonte sempre os mesmos canais curados do GTA6
+// Hunter (nunca concorrentes genéricos — ver src/trend-hunter/gta6-capture.js,
+// getGta6LongVideo). Desative com LONG_VIDEO_GTA6_ENABLED=false.
+const LONG_VIDEO_GTA6_ENABLED = process.env.LONG_VIDEO_GTA6_ENABLED !== 'false' && GTA6_ENABLED;
+const LONG_VIDEOS_GTA6_DIR = path.resolve(process.env.LONG_VIDEOS_GTA6_DIR || './output/longos-gta6');
+const LONG_VIDEO_GTA6_CRON = process.env.CRON_VIDEO_LONGO_GTA6 || '30 21 * * *';
+const LONG_STATE_GTA6_PATH = path.resolve('./postados/long-video-gta6-state.json');
 
 function todayKey() {
     // Data local no fuso configurado, formato YYYY-MM-DD
@@ -323,17 +420,23 @@ async function fetchMainLongVideo() {
     return filePath;
 }
 
-/** Fonte do vídeo longo do Canal da Fé: sempre uma prédica/live inteira do próprio canal do Bispo. */
+/** Fonte do vídeo longo do Canal da Fé: uma live de oração inteira de um canal terceiro
+ *  rotativo (ver PRAYER_LIVE_CHANNELS em src/canal-da-fe/long-video.js) — não mais o canal do
+ *  Bispo (ver histórico de memória do strike de 2026-08-24). */
 async function fetchFeLongVideo() {
-    const { getBispoLongVideo } = await import('../src/canal-da-fe/long-video.js');
-    return getBispoLongVideo();
+    const { getPrayerLongVideo } = await import('../src/canal-da-fe/long-video.js');
+    return getPrayerLongVideo();
 }
 
+// skipTikTok: true em todos os vídeos longos abaixo — a pedido (04/09/2026),
+// vídeo longo só vai pro YouTube. Shorts continuam postando nas duas
+// plataformas normalmente, isso afeta só o ciclo diário de vídeo longo.
 const MAIN_LONG_CFG = {
     label: 'Longo',
     dir: LONG_VIDEOS_DIR,
     statePath: LONG_STATE_PATH,
     getFallbackVideo: fetchMainLongVideo,
+    postOptions: { skipTikTok: true },
 };
 
 const FE_LONG_CFG = {
@@ -344,6 +447,41 @@ const FE_LONG_CFG = {
     postOptions: {
         ytProfileDir: BISPO_PERSONA?.youtubeProfileDir,
         ttProfileDir: BISPO_PERSONA?.tiktokProfileDir,
+        skipTikTok: true,
+    },
+};
+
+/** Fonte do vídeo longo do Canal Infantil: sempre um vídeo inteiro do próprio canal do Luccas Neto. */
+async function fetchInfantilLongVideo() {
+    const { getLucasNetoLongVideo } = await import('../src/canal-infantil/long-video.js');
+    return getLucasNetoLongVideo();
+}
+
+/** Fonte do vídeo longo do GTA VI: sempre a íntegra de um vídeo em alta dos canais curados do Hunter (nunca concorrentes genéricos). */
+async function fetchGta6LongVideo() {
+    const { getGta6LongVideo } = await import('../src/trend-hunter/gta6-capture.js');
+    return getGta6LongVideo();
+}
+
+const INFANTIL_LONG_CFG = {
+    label: 'Longo Infantil',
+    dir: LONG_VIDEOS_INFANTIL_DIR,
+    statePath: LONG_STATE_INFANTIL_PATH,
+    getFallbackVideo: fetchInfantilLongVideo,
+    postOptions: {
+        ytProfileDir: LUCASNETO_PERSONA?.youtubeProfileDir,
+        skipTikTok: true,
+    },
+};
+
+const GTA6_LONG_CFG = {
+    label: 'Longo GTA VI',
+    dir: LONG_VIDEOS_GTA6_DIR,
+    statePath: LONG_STATE_GTA6_PATH,
+    getFallbackVideo: fetchGta6LongVideo,
+    postOptions: {
+        ytProfileDir: GTA6_PERSONA?.youtubeProfileDir,
+        skipTikTok: true,
     },
 };
 
@@ -399,6 +537,24 @@ async function runUploadCycle() {
             // rodízio esperando futebol pra sempre — tenta de novo no próximo
             // lote fechado.
             advanceQueueState(FOOTBALL_TURN_NAME);
+        }
+
+        // ── Nível -0.9: turno diário de TikTok Live ───────────────────────────
+        // Ao contrário do futebol, NÃO limpa a pendência quando não há clipe
+        // disponível — continua tentando nos próximos horários do mesmo dia
+        // (só marca como feito quando realmente consegue postar algo).
+        if (!FORCED_PERSONA_NAME && isTikTokLiveTurnPending()) {
+            const tiktokSource = pickTikTokLiveSource();
+            if (tiktokSource) {
+                logger.step(`[Poster] 📱 Turno diário de TikTok Live — fonte: ${tiktokSource.displayName}`);
+                const tiktokDir = getPersonaOutputDir(tiktokSource);
+                const tiktokVideo = getNextVideoFromPersona(tiktokDir);
+                if (tiktokVideo) {
+                    await postVideoJob(tiktokSource, tiktokVideo, () => advanceQueueState(TIKTOK_LIVE_TURN_NAME));
+                    return;
+                }
+            }
+            logger.warn('[Poster] 📱 Turno diário de TikTok Live pendente, mas nenhuma persona (Weslay Alemão/MC Feijuca/Buzeira/Ana McQueen) tem clipe pronto agora — tenta de novo no próximo horário.');
         }
 
         // ── Nível 0: turno do Trend Hunter com pasta vazia → captura o corte
@@ -533,7 +689,7 @@ async function runUploadCycle() {
 async function postVideoJob(activePersona, video, advance) {
     const { filePath } = video;
     const currentFile = filePath; // rastreado para deduplicação de segurança em caso de crash
-    const results = { youtube: null, tiktok: null };
+    const results = { youtube: null, tiktok: null, instagram: null };
 
     // ── Interruptor mestre de teste ────────────────────────────────────────────
     // UPLOAD_TO_YOUTUBE/UPLOAD_TO_TIKTOK não bastam sozinhos: contas dedicadas
@@ -609,8 +765,25 @@ async function postVideoJob(activePersona, video, advance) {
                 }
             }
         } catch (err) {
-            logger.warn(`[Metadata] IA falhou (${err.message}) — pulando vídeo para evitar título genérico.`);
-            logger.info('[Poster] Vídeo deixado em ./output/ para nova tentativa no próximo ciclo.');
+            // Arquivo corrompido (download/encode truncado) trava o turno da
+            // persona pra sempre: advance() já soma pro lote de POSTS_PER_PERSONA
+            // mesmo sem post real (ver round-robin.js), mas o PRÓPRIO arquivo
+            // continua lá — o próximo ciclo pega ele de novo (getNextVideoFromPersona
+            // não sabe que já falhou) e falha de novo, na prática travando a
+            // persona sem nunca postar nada até alguém apagar manualmente (foi o
+            // que aconteceu com Renato Cariani em 06/09/2026: 2 tentativas
+            // seguidas na mesma "moov atom not found", zero posts do canal
+            // principal o dia inteiro). Corrompido de verdade não se recupera
+            // sozinho — descarta igual ao guard de duração curta acima, pra
+            // liberar o próximo vídeo real da mesma persona no próximo ciclo.
+            const isCorrupted = /moov atom not found|Invalid data found when processing input/i.test(err.message);
+            if (isCorrupted) {
+                logger.error(`[Metadata] Arquivo corrompido detectado (${err.message.split('\n')[0]}) — descartando: ${path.basename(filePath)}`);
+                try { fs.unlinkSync(filePath); } catch { /* já pode ter sido removido */ }
+            } else {
+                logger.warn(`[Metadata] IA falhou (${err.message}) — pulando vídeo para evitar título genérico.`);
+                logger.info('[Poster] Vídeo deixado em ./output/ para nova tentativa no próximo ciclo.');
+            }
             advance(activePersona.name);
             return;
         }
@@ -654,8 +827,12 @@ async function postVideoJob(activePersona, video, advance) {
         // TikTok: caption único com título + descrição + hashtags (máx 2200 chars)
         const tikTokCaption = formatTikTokCaption(metadata);
 
+        // Instagram: mesma ideia do TikTok, mas com hashtags mais enxutas
+        const instagramCaption = formatInstagramCaption(metadata);
+
         logger.info(`[Poster] Título YT   : "${finalTitle}"`);
         logger.info(`[Poster] Caption TT  : "${tikTokCaption.slice(0, 100)}${tikTokCaption.length > 100 ? '...' : ''}"`);
+        logger.info(`[Poster] Caption IG  : "${instagramCaption.slice(0, 100)}${instagramCaption.length > 100 ? '...' : ''}"`);
 
         // Valida o caption do TikTok antes de postar
         const ttValidation = validateTikTokCaption(tikTokCaption);
@@ -664,8 +841,21 @@ async function postVideoJob(activePersona, video, advance) {
         }
         for (const warn of ttValidation.warnings) logger.warn(`[Validator/TikTok] ⚠️  ${warn}`);
 
+        // Valida o caption do Instagram antes de postar
+        const igValidation = validateInstagramCaption(instagramCaption);
+        if (!igValidation.valid) {
+            for (const err of igValidation.errors) logger.error(`[Validator/Instagram] ❌ ${err}`);
+        }
+        for (const warn of igValidation.warnings) logger.warn(`[Validator/Instagram] ⚠️  ${warn}`);
+
         // ── YouTube ────────────────────────────────────────────────────────────
-        if (UPLOAD_YOUTUBE) {
+        const ytThrottleMs = UPLOAD_YOUTUBE ? msUntilNextAllowed('youtube') : 0;
+        if (UPLOAD_YOUTUBE && activePersona.skipYoutube) {
+            logger.info(`[Poster] YouTube pulado — persona "${activePersona.displayName}" posta só no TikTok.`);
+        } else if (UPLOAD_YOUTUBE && ytThrottleMs > 0) {
+            logThrottled('youtube', ytThrottleMs);
+            results.youtube = null;
+        } else if (UPLOAD_YOUTUBE) {
             if (isYouTubePosted(filePath)) {
                 logger.warn('[Poster] ⚠️  Arquivo já enviado ao YouTube (youtube-registry) — pulando para evitar duplicata.');
                 results.youtube = null;
@@ -674,6 +864,7 @@ async function postVideoJob(activePersona, video, advance) {
                 // Registra ANTES de tentar: se o processo for interrompido durante o
                 // upload, o arquivo não será reenviado ao YouTube no próximo ciclo.
                 registerYouTubePosted(filePath);
+                recordUploadAttempt('youtube');
                 // Persona com canal próprio (ex.: religioso) usa o perfil dela;
                 // as demais usam o perfil padrão da conta principal.
                 const ytProfileDir = activePersona.youtubeProfileDir
@@ -689,10 +880,11 @@ async function postVideoJob(activePersona, video, advance) {
             logger.warn('Upload para YouTube desabilitado (UPLOAD_TO_YOUTUBE=false).');
         }
 
-        // Personas com tiktokProfileDir têm conta própria de TikTok e ligam o
-        // upload independente do interruptor global UPLOAD_TO_TIKTOK — que
+        // Personas com tiktokProfileDir/instagramProfileDir têm conta própria e ligam
+        // o upload independente do interruptor global UPLOAD_TO_TIKTOK/INSTAGRAM — que
         // continua controlando só a rotação principal (conta ainda não configurada).
         const tiktokEnabled = activePersona.tiktokProfileDir ? true : UPLOAD_TIKTOK;
+        const instagramEnabled = activePersona.instagramProfileDir ? true : UPLOAD_INSTAGRAM;
 
         // Intervalo entre plataformas para estabilidade
         if (UPLOAD_YOUTUBE && tiktokEnabled) {
@@ -700,8 +892,12 @@ async function postVideoJob(activePersona, video, advance) {
         }
 
         // ── TikTok ─────────────────────────────────────────────────────────────
+        const ttThrottleMs = tiktokEnabled ? msUntilNextAllowed('tiktok') : 0;
         if (tiktokEnabled && activePersona.skipTikTok) {
             logger.info(`[Poster] TikTok pulado — persona "${activePersona.displayName}" posta só no YouTube.`);
+        } else if (tiktokEnabled && ttThrottleMs > 0) {
+            logThrottled('tiktok', ttThrottleMs);
+            results.tiktok = null;
         } else if (tiktokEnabled) {
             if (isTikTokPosted(filePath)) {
                 logger.warn('[Poster] ⚠️  Arquivo já enviado ao TikTok (tiktok-registry) — pulando para evitar duplicata.');
@@ -711,6 +907,7 @@ async function postVideoJob(activePersona, video, advance) {
                 // Registra ANTES de tentar: se o processo crashar durante o upload,
                 // o arquivo não será reenviado ao TikTok no próximo ciclo.
                 registerTikTokPosted(filePath);
+                recordUploadAttempt('tiktok');
                 // Mesma lógica do YouTube: persona com conta de TikTok própria
                 // (ex.: canal religioso) usa o perfil dela; as demais usam a conta
                 // principal.
@@ -718,19 +915,63 @@ async function postVideoJob(activePersona, video, advance) {
                     ? path.resolve(activePersona.tiktokProfileDir)
                     : undefined;
                 if (ttProfileDir) logger.info(`[Poster] Conta TikTok dedicada: ${activePersona.displayName} → ${activePersona.tiktokProfileDir}`);
-                results.tiktok = await uploadToTikTok(filePath, tikTokCaption, HEADLESS, ttProfileDir);
+                results.tiktok = await uploadToTikTok(filePath, tikTokCaption, HEADLESS, ttProfileDir, thumbnailPath);
                 if (results.tiktok === true) registerContentPosted(filePath);
             }
         } else {
             logger.warn('Upload para TikTok desabilitado (UPLOAD_TO_TIKTOK=false).');
         }
 
+        // Intervalo entre plataformas para estabilidade
+        if ((UPLOAD_YOUTUBE || tiktokEnabled) && instagramEnabled) {
+            await new Promise((r) => setTimeout(r, 10_000));
+        }
+
+        // ── Instagram ──────────────────────────────────────────────────────────
+        const igThrottleMs = instagramEnabled ? msUntilNextAllowed('instagram') : 0;
+        if (instagramEnabled && activePersona.skipInstagram) {
+            logger.info(`[Poster] Instagram pulado — persona "${activePersona.displayName}" não posta no Instagram.`);
+        } else if (instagramEnabled && igThrottleMs > 0) {
+            // Intervalo mínimo entre posts reais (poster/upload-pacing.js) — não
+            // conta como falha nem toca o registry, só adia pro próximo ciclo.
+            logThrottled('instagram', igThrottleMs);
+            results.instagram = null;
+        } else if (instagramEnabled) {
+            if (isInstagramPosted(filePath)) {
+                logger.warn('[Poster] ⚠️  Arquivo já enviado ao Instagram (instagram-registry) — pulando para evitar duplicata.');
+                results.instagram = null;
+            } else {
+                logger.step('📸 Upload → Instagram...');
+                // Registra ANTES de tentar: se o processo crashar durante o upload,
+                // o arquivo não será reenviado ao Instagram no próximo ciclo.
+                registerInstagramPosted(filePath);
+                recordUploadAttempt('instagram');
+                const igProfileDir = activePersona.instagramProfileDir
+                    ? path.resolve(activePersona.instagramProfileDir)
+                    : undefined;
+                if (igProfileDir) logger.info(`[Poster] Conta Instagram dedicada: ${activePersona.displayName} → ${activePersona.instagramProfileDir}`);
+                results.instagram = await uploadToInstagram(filePath, instagramCaption, HEADLESS, igProfileDir);
+                if (results.instagram === true) registerContentPosted(filePath);
+            }
+        } else {
+            logger.warn('Upload para Instagram desabilitado (UPLOAD_TO_INSTAGRAM=false).');
+        }
+
         // ── Registra e move o arquivo ─────────────────────────────────────────
         // IMPORTANTE: o arquivo sempre é registrado no registry, independente do resultado.
         // Isso garante que mesmo um erro inesperado (timeout, crash) não cause re-postagem.
-        const anySuccess = results.youtube === true || results.tiktok === true;
+        const anySuccess = results.youtube === true || results.tiktok === true || results.instagram === true;
 
         if (anySuccess) {
+            // Repost pro Bilibili mainland — ANTES de markAsPosted mover o
+            // arquivo pra ./postados, senão o caminho abaixo já não existe
+            // mais (enqueueRepost copia o arquivo na hora, ver repost-queue.js).
+            if (BILIBILI_REPOST_ENABLED && BILIBILI_REPOST_ELIGIBLE.has(activePersona.name)) {
+                const bilibiliSourceUrl = getPersonaSourceUrl(activePersona);
+                if (bilibiliSourceUrl) {
+                    enqueueRepost({ localPath: filePath, sourceUrl: bilibiliSourceUrl, persona: activePersona.name });
+                }
+            }
             markAsPosted(filePath);
             // Sidecar .meta.json (vídeos gerados) não fica órfão em ./output
             if (hasSidecar) { try { fs.unlinkSync(sidecarPath); } catch { /* ok */ } }
@@ -756,7 +997,7 @@ async function postVideoJob(activePersona, video, advance) {
 
         logger.cron(
             `✅ Ciclo concluído — ${activePersona.displayName} | ` +
-            `YouTube: ${fmtResult(results.youtube)} | TikTok: ${fmtResult(results.tiktok)}`
+            `YouTube: ${fmtResult(results.youtube)} | TikTok: ${fmtResult(results.tiktok)} | Instagram: ${fmtResult(results.instagram)}`
         );
 
     } catch (err) {
@@ -804,6 +1045,8 @@ async function ensureChannelVideo(persona) {
         await generateCanalDaFeVideo();
     } else if (persona.name === CANALINFANTIL_PERSONA.name) {
         await generateCanalInfantilVideo();
+    } else if (persona.name === GTA6_PERSONA.name) {
+        await captureGta6TrendClip();
     } else {
         await capturePersona(persona, { force: false, minClips: 1 });
     }
@@ -891,7 +1134,7 @@ function printBanner() {
 
     console.log('\n\x1b[35m' + '═'.repeat(58) + '\x1b[0m');
     console.log('\x1b[35m  📅  CANAL CORTE — Auto-Poster (Round-Robin)\x1b[0m');
-    console.log(`\x1b[35m      Headless: ${HEADLESS ? 'ON' : 'OFF'}  |  YouTube: ${UPLOAD_YOUTUBE ? 'ON' : 'OFF'}  |  TikTok: ${UPLOAD_TIKTOK ? 'ON' : 'OFF'}\x1b[0m`);
+    console.log(`\x1b[35m      Headless: ${HEADLESS ? 'ON' : 'OFF'}  |  YouTube: ${UPLOAD_YOUTUBE ? 'ON' : 'OFF'}  |  TikTok: ${UPLOAD_TIKTOK ? 'ON' : 'OFF'}  |  Instagram: ${UPLOAD_INSTAGRAM ? 'ON' : 'OFF'}\x1b[0m`);
     console.log(`\x1b[35m      Personas: ${ROTATION_PERSONAS.map((p) => p.displayName).join(' → ')}\x1b[0m`);
     console.log(`\x1b[35m      Turno atual: ${current.displayName} (índice ${state.index})\x1b[0m`);
     console.log(`\x1b[35m      Horários: ${slots}\x1b[0m`);
@@ -905,6 +1148,12 @@ function printBanner() {
     }
     if (LONG_VIDEO_FE_ENABLED) {
         console.log(`\x1b[35m      Vídeo longo (Canal da Fé): 1/dia (${LONG_VIDEO_FE_CRON}) — pasta: output/longos-fe — fonte: Bispo Bruno Leonardo\x1b[0m`);
+    }
+    if (LONG_VIDEO_INFANTIL_ENABLED) {
+        console.log(`\x1b[35m      Vídeo longo (Canal Infantil): 1/dia (${LONG_VIDEO_INFANTIL_CRON}) — pasta: output/longos-infantil — fonte: Luccas Neto\x1b[0m`);
+    }
+    if (LONG_VIDEO_GTA6_ENABLED) {
+        console.log(`\x1b[35m      Vídeo longo (GTA VI): 1/dia (${LONG_VIDEO_GTA6_CRON}) — pasta: output/longos-gta6 — fonte: canais curados do GTA6 Hunter\x1b[0m`);
     }
     console.log('\x1b[35m' + '═'.repeat(58) + '\x1b[0m\n');
 }
@@ -1037,6 +1286,7 @@ async function main() {
         const finalTitle = formatTitle(metadata);
         const ytDescription = formatYouTubeDescription(metadata);
         const caption = formatTikTokCaption(metadata);
+        const igCaption = formatInstagramCaption(metadata);
         const dryRotation = buildRotation(ROTATION_PERSONAS);
         const nextPersona = dryRotation[(state.index + 1) % dryRotation.length]?.displayName ?? '—';
 
@@ -1051,9 +1301,11 @@ async function main() {
         console.log(`\n  \x1b[33mTítulo YT\x1b[0m      : ${finalTitle}`);
         console.log(`\n  \x1b[33mDescrição YT\x1b[0m   :\n  ${ytDescription.replace(/\n/g, '\n  ')}`);
         console.log(`\n  \x1b[33mCaption TikTok\x1b[0m :\n  ${caption.slice(0, 300).replace(/\n/g, '\n  ')}${caption.length > 300 ? '\n  ...' : ''}`);
+        console.log(`\n  \x1b[33mCaption Instagram\x1b[0m :\n  ${igCaption.slice(0, 300).replace(/\n/g, '\n  ')}${igCaption.length > 300 ? '\n  ...' : ''}`);
         console.log(`\n  \x1b[33mPróxima persona\x1b[0m: ${nextPersona}`);
         console.log(`  \x1b[33mUpload YouTube\x1b[0m : ${UPLOAD_YOUTUBE ? '✅ habilitado' : '❌ desabilitado'}`);
         console.log(`  \x1b[33mUpload TikTok\x1b[0m  : ${UPLOAD_TIKTOK ? '✅ habilitado' : '❌ desabilitado'}`);
+        console.log(`  \x1b[33mUpload Instagram\x1b[0m : ${UPLOAD_INSTAGRAM ? '✅ habilitado' : '❌ desabilitado'}`);
 
         console.log(`\n\x1b[2m  ⚠️  Nada foi postado. Arquivo permanece em ./output/.\x1b[0m`);
         console.log(`\x1b[2m  Para postar de verdade: npm run poster:now\x1b[0m`);
@@ -1081,6 +1333,8 @@ async function main() {
         const feOnly = FORCED_PERSONA_NAME === CANALDAFE_PERSONA.name || FORCED_PERSONA_NAME === 'bispobrunoleonardo';
         if (!feOnly && LONG_VIDEO_ENABLED) await runLongVideoCycle(MAIN_LONG_CFG, { force });
         if (LONG_VIDEO_FE_ENABLED) await runLongVideoCycle(FE_LONG_CFG, { force });
+        if (LONG_VIDEO_INFANTIL_ENABLED) await runLongVideoCycle(INFANTIL_LONG_CFG, { force });
+        if (LONG_VIDEO_GTA6_ENABLED) await runLongVideoCycle(GTA6_LONG_CFG, { force });
         process.exit(0);
     }
 
@@ -1112,10 +1366,45 @@ async function main() {
                     await runLongVideoCycle(FE_LONG_CFG);
                 }
             }
+            if (LONG_VIDEO_INFANTIL_ENABLED) {
+                if (loadLongState(LONG_STATE_INFANTIL_PATH).lastPostDate === todayKey()) {
+                    logger.info('[Longo Infantil] Vídeo longo de hoje já publicado — pulando no --now.');
+                } else {
+                    logger.cron('🎬 Vídeo longo do dia (Canal Infantil) ainda pendente — publicando...');
+                    await runLongVideoCycle(INFANTIL_LONG_CFG);
+                }
+            }
+            if (LONG_VIDEO_GTA6_ENABLED) {
+                if (loadLongState(LONG_STATE_GTA6_PATH).lastPostDate === todayKey()) {
+                    logger.info('[Longo GTA VI] Vídeo longo de hoje já publicado — pulando no --now.');
+                } else {
+                    logger.cron('🎬 Vídeo longo do dia (GTA VI) ainda pendente — publicando...');
+                    await runLongVideoCycle(GTA6_LONG_CFG);
+                }
+            }
         }
         process.exit(0);
     }
 
+
+    // ── Validação de sessões ponta a ponta (antes do agendamento) ──────────────
+    // Só roda no modo daemon normal (não em --dry-run/--long-now/--now, que já
+    // saíram acima) — é exatamente "antes da programação iniciar".
+    const SESSION_ACCOUNTS = [
+        UPLOAD_YOUTUBE && { id: 'main-yt', label: 'Canal Principal', platform: 'youtube', profileDir: './profiles/chrome-youtube' },
+        UPLOAD_TIKTOK && { id: 'main-tt', label: 'Canal Principal', platform: 'tiktok', profileDir: './profiles/chrome-tiktok' },
+        UPLOAD_INSTAGRAM && { id: 'main-ig', label: 'Canal Principal', platform: 'instagram', profileDir: './profiles/chrome-instagram' },
+        UPLOAD_YOUTUBE && BISPO_PERSONA && !BISPO_PERSONA.skipYoutube && { id: 'fe-yt', label: 'Canal da Fé', platform: 'youtube', profileDir: BISPO_PERSONA.youtubeProfileDir },
+        UPLOAD_TIKTOK && BISPO_PERSONA && !BISPO_PERSONA.skipTikTok && { id: 'fe-tt', label: 'Canal da Fé', platform: 'tiktok', profileDir: BISPO_PERSONA.tiktokProfileDir },
+        UPLOAD_YOUTUBE && LUCASNETO_ENABLED && LUCASNETO_PERSONA && !LUCASNETO_PERSONA.skipYoutube && { id: 'infantil-yt', label: 'Canal Infantil', platform: 'youtube', profileDir: LUCASNETO_PERSONA.youtubeProfileDir },
+        UPLOAD_TIKTOK && LUCASNETO_ENABLED && LUCASNETO_PERSONA && !LUCASNETO_PERSONA.skipTikTok && { id: 'infantil-tt', label: 'Canal Infantil', platform: 'tiktok', profileDir: LUCASNETO_PERSONA.tiktokProfileDir },
+        UPLOAD_YOUTUBE && GTA6_ENABLED && !GTA6_PERSONA.skipYoutube && { id: 'gta6-yt', label: 'GTA VI', platform: 'youtube', profileDir: GTA6_PERSONA.youtubeProfileDir },
+        UPLOAD_TIKTOK && GTA6_ENABLED && !GTA6_PERSONA.skipTikTok && { id: 'gta6-tt', label: 'GTA VI', platform: 'tiktok', profileDir: GTA6_PERSONA.tiktokProfileDir },
+    ].filter(Boolean);
+
+    await validateAllSessions(SESSION_ACCOUNTS).catch((err) => {
+        logger.warn(`[SessionCheck] Falhou ao validar sessões (${err.message}) — seguindo mesmo assim.`);
+    });
 
     // Registra todos os slots de cron
     let registered = 0;
@@ -1161,6 +1450,32 @@ async function main() {
         }
     }
 
+    // Slot diário do vídeo longo (Canal Infantil — Luccas Neto)
+    if (LONG_VIDEO_INFANTIL_ENABLED) {
+        if (cron.validate(LONG_VIDEO_INFANTIL_CRON)) {
+            cron.schedule(LONG_VIDEO_INFANTIL_CRON, () => {
+                logger.cron(`⏰ Horário do vídeo longo do Canal Infantil (${LONG_VIDEO_INFANTIL_CRON}) — disparando...`);
+                runLongVideoCycle(INFANTIL_LONG_CFG);
+            }, { timezone: TIMEZONE });
+            logger.success(`Agendamento do vídeo longo (Canal Infantil) registrado: ${LONG_VIDEO_INFANTIL_CRON} (pasta: ${LONG_VIDEOS_INFANTIL_DIR})`);
+        } else {
+            logger.error(`Expressão cron inválida em CRON_VIDEO_LONGO_INFANTIL: "${LONG_VIDEO_INFANTIL_CRON}" — vídeo longo diário do Canal Infantil desativado.`);
+        }
+    }
+
+    // Slot diário do vídeo longo (GTA VI)
+    if (LONG_VIDEO_GTA6_ENABLED) {
+        if (cron.validate(LONG_VIDEO_GTA6_CRON)) {
+            cron.schedule(LONG_VIDEO_GTA6_CRON, () => {
+                logger.cron(`⏰ Horário do vídeo longo do GTA VI (${LONG_VIDEO_GTA6_CRON}) — disparando...`);
+                runLongVideoCycle(GTA6_LONG_CFG);
+            }, { timezone: TIMEZONE });
+            logger.success(`Agendamento do vídeo longo (GTA VI) registrado: ${LONG_VIDEO_GTA6_CRON} (pasta: ${LONG_VIDEOS_GTA6_DIR})`);
+        } else {
+            logger.error(`Expressão cron inválida em CRON_VIDEO_LONGO_GTA6: "${LONG_VIDEO_GTA6_CRON}" — vídeo longo diário do GTA VI desativado.`);
+        }
+    }
+
     if (registered === 0) {
         logger.error('Nenhum agendamento válido configurado. Encerrando.');
         process.exit(1);
@@ -1186,6 +1501,8 @@ async function main() {
 
     if (LONG_VIDEO_ENABLED) recoverMissedLongVideo(MAIN_LONG_CFG, LONG_VIDEO_CRON);
     if (LONG_VIDEO_FE_ENABLED) recoverMissedLongVideo(FE_LONG_CFG, LONG_VIDEO_FE_CRON);
+    if (LONG_VIDEO_INFANTIL_ENABLED) recoverMissedLongVideo(INFANTIL_LONG_CFG, LONG_VIDEO_INFANTIL_CRON);
+    if (LONG_VIDEO_GTA6_ENABLED) recoverMissedLongVideo(GTA6_LONG_CFG, LONG_VIDEO_GTA6_CRON);
 
     // Vídeo longo só recupera no boot (cobre reinício). O round-robin normal
     // roda dias sem reiniciar, então precisa de um watchdog contínuo — ver
