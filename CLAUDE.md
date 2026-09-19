@@ -11,16 +11,30 @@ Automação completa de 3 canais do YouTube (+ TikTok) rodando na máquina Windo
    de YouTube e Twitch), escolhidos automaticamente pelo momento de maior audiência (heatmap/chat).
 2. **Canal da Fé** — canal religioso dedicado (Bispo Bruno Leonardo): cortes do próprio canal dele +
    vídeos gerados por IA (roteiro + FLUX + narração + Remotion, pipeline Python em `canal_da_fe/`).
+   O canal original morreu (strikes de copyright — ver histórico de memória
+   `project_canal_da_fe_copyright_strike`); o canal ativo hoje é **A Fé Move Montanhas** (mesma
+   persona `bispobrunoleonardo`, conta/perfil novos), já com volume real de inscritos e views. Vídeo
+   longo dedicado segue pausado (`LONG_VIDEO_FE_ENABLED`) até decisão de fonte de conteúdo.
 3. **Canal Infantil** — Shorts educativos infantis: cortes do Luccas Neto + vídeos gerados por IA
-   (roteiro Groq + Pexels + Edge-TTS + FFmpeg, pipeline Python em `canal_infantil/`). **Pausado desde
-   2026-08-22** — persona `lucasneto` comentada em `personas.js` e `CANALINFANTIL_IN_ROTATION=false`
-   no `.env`; um canal novo está planejado para substituí-lo. Reative movendo a persona de volta e
-   ligando a flag.
+   (roteiro Groq + Pexels + Edge-TTS + FFmpeg, pipeline Python em `canal_infantil/`). Cortes ativos
+   desde 19/09/2026 (conta `ferfertanus@hotmail.com`, suspensa em 07/09, teve o acesso confirmado de
+   volta via `poster/session-check.js`). Geração por IA segue desligada de propósito
+   (`CANALINFANTIL_IN_ROTATION=false` no `.env`) — reative ligando a flag quando decidirem retomar
+   esse lado também.
 
 Cada canal publica sozinho, em horários fixos (cron), sem aprovação manual — geração de
 título/descrição/hashtags via IA (Gemini primário, Groq fallback), upload via Playwright
 (YouTube/TikTok não têm API pública de upload utilizável aqui) e, para o YouTube, resposta
 automática a comentários via API oficial (`googleapis`).
+
+### Escopo "pessoal" vs projetos de cliente
+
+O usuário roda, na mesma máquina, este projeto (**CorteCerto034** — todos os canais acima, incluindo
+GTA VI e Bilibili) lado a lado com projetos profissionais/de cliente isolados em outras pastas
+(`uNuts`, `livro-sagrado-br`). Ele se refere a este projeto inteiro como **"pessoal"** ou **"escopo
+pessoal"**. São contextos de risco/prioridade diferentes (bugs aqui afetam só o usuário; bugs nos
+projetos de cliente afetam entrega pra terceiros) — não misturar credenciais, config ou decisões
+entre eles.
 
 ## Comandos comuns
 

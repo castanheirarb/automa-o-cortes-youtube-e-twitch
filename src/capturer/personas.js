@@ -12,6 +12,12 @@
 //                     'blur'   frame 16:9 completo centralizado sobre fundo desfocado
 //                     'split'  facecam em cima + gameplay embaixo
 //                     'asd'    crop 9:16 dinâmico seguindo quem fala (padrão)
+//   youtubeProfileDir / tiktokProfileDir / instagramProfileDir → roteia a persona pra um
+//                   perfil de navegador Playwright dedicado (conta própria) em vez da conta
+//                   principal — quando presente, SEMPRE tenta aquela plataforma, ignorando o
+//                   interruptor global (UPLOAD_TO_YOUTUBE/TIKTOK/INSTAGRAM no .env).
+//   skipYoutube / skipTikTok / skipInstagram → desliga a postagem numa plataforma específica
+//                   pra essa persona (a captação continua normal).
 
 export const PERSONAS = [
     // ── YouTube ──────────────────────────────────────────────────────────────
@@ -53,13 +59,17 @@ export const PERSONAS = [
     },
 
     // ── Canal religioso (posta no perfil dedicado chrome-youtube-02) ────────
-    // Reativado (2026-08-25): só os CORTES CURTOS voltam — o vídeo longo
-    // segue pausado de propósito (LONG_VIDEO_FE_ENABLED=false no .env), já
-    // que foi ele que tomou o copyright strike da Soares Music Digital em
-    // 2026-08-24 (ver histórico). Mitigação de música de fundo (isolamento
-    // de voz via Demucs, src/processor/vocal-isolate.js) já entra sozinha
-    // pra esse nicho — testada com GPU nos vídeos reais que tomaram strike
-    // antes desta reativação.
+    // YouTube TOTALMENTE RESTAURADO (08/09/2026): canal antigo tinha levado
+    // copyright strike da Soares Music Digital em 24/08/2026 e nunca voltou —
+    // conta nova criada do zero (gcastanheira64@gmail.com), logada e validada
+    // de ponta a ponta (poster/session-check.js) antes de reativar. TikTok
+    // (chrome-tiktok-02) nunca saiu do ar. Shorts dos cortes do próprio Bispo
+    // voltam normalmente nas duas plataformas.
+    // Vídeo longo segue DESLIGADO de propósito (LONG_VIDEO_FE_ENABLED=false) —
+    // a fonte antiga (prédica/live inteira do próprio canal) foi exatamente o
+    // que causou o strike; antes de religar, decidir uma fonte de conteúdo
+    // religioso pra vídeo longo que não repita esse risco (ver pesquisa em
+    // memória/histórico de 08/09/2026).
     {
         name: 'bispobrunoleonardo',
         displayName: 'Bispo Bruno Leonardo',
@@ -71,6 +81,34 @@ export const PERSONAS = [
         weight: 1,
         youtubeProfileDir: './profiles/chrome-youtube-02',
         tiktokProfileDir: './profiles/chrome-tiktok-02',
+        uniformPeaksFallback: true,
+    },
+
+    // ── Canal infantil (posta no perfil dedicado chrome-youtube-03) ─────────
+    // Reativado (02/09/2026) com o canal substituto (conta nova, ferfertanus@
+    // hotmail.com — a antiga sessão do Luccas Neto ficou em
+    // profiles/chrome-youtube-03-luccasneto-old, não foi apagada). Só os
+    // CORTES do Luccas Neto voltam por enquanto — a geração por IA
+    // (CANALINFANTIL_PERSONA) segue desligada de propósito
+    // (CANALINFANTIL_IN_ROTATION=false no .env) até decidirmos reativar
+    // também. skipTikTok: true porque a conta de TikTok desse canal ainda
+    // não existe/logou.
+    // skipYoutube removido em 19/09/2026: suspensão de 07/09 confirmada revertida
+    // (poster/session-check.js validou acesso real ao studio.youtube.com, não só
+    // sessão de navegador salva). Se voltar a falhar, ver histórico em memória
+    // (project_canalinfantil_youtube_suspended).
+    {
+        name: 'lucasneto',
+        displayName: 'Luccas Neto',
+        platform: 'youtube',
+        channelUrl: 'https://www.youtube.com/@luccasneto/videos',
+        clipsPerRun: 5,
+        videoOffset: 1,
+        niche: 'infantil',
+        weight: 1,
+        youtubeProfileDir: process.env.CANALINFANTIL_PROFILE || './profiles/chrome-youtube-03',
+        skipTikTok: true,
+        madeForKids: true,
         uniformPeaksFallback: true,
     },
 
@@ -110,13 +148,59 @@ export const PERSONAS = [
         niche: 'react',
     },
 
+    // ── TikTok (lives — monitor orientado a evento, ver live-monitor-tiktok.js) ──
+    // channelUrl = @handle sem o "@". Handles pesquisados em 03/09/2026 —
+    // @fejuquinhanovo (MC Feijuca) ainda não teve confirmação visual do dono
+    // do projeto, confira antes de assumir 100% certo. Gabizinha e iShow
+    // ficaram de fora por ora: Gabizinha tem 2 contas candidatas ativas
+    // (@gabizinhalive_ e @gabizinhaolvr) e iShow só apareceu com nome de
+    // exibição nos rankings pesquisados, sem @handle confiável — não dá pra
+    // adicionar sem arriscar monitorar a conta errada (falha silenciosa: a
+    // live nunca dispara e nada acusa erro).
+    {
+        name: 'wesleyalemao',
+        displayName: 'Weslay Alemão',
+        platform: 'tiktok',
+        channelUrl: 'wesley.alemao_',
+        clipsPerRun: 5,
+        niche: 'podcast', // treta/confronto — fórmulas de CONFRONTO/POLÊMICA encaixam melhor que 'react'
+        weight: 2,
+    },
+    {
+        name: 'mcfeijuca',
+        displayName: 'MC Feijuca',
+        platform: 'tiktok',
+        channelUrl: 'fejuquinhanovo', // pendente de confirmação visual — ver nota acima
+        clipsPerRun: 5,
+        niche: 'podcast',
+        weight: 2,
+    },
+    {
+        name: 'buzeira',
+        displayName: 'Buzeira',
+        platform: 'tiktok',
+        channelUrl: 'buzeira',
+        clipsPerRun: 5,
+        niche: 'podcast',
+        weight: 2,
+    },
+    {
+        name: 'anamcqueen',
+        displayName: 'Ana McQueen',
+        platform: 'tiktok',
+        channelUrl: '_annamcqueen',
+        clipsPerRun: 5,
+        niche: 'default',
+        weight: 1,
+        // O nome colide demais com coisa famosa pra busca por nome funcionar
+        // (achado na prática 08/09/2026, 2 tentativas seguidas erradas: 1x
+        // Relâmpago McQueen/Pixar, 1x Anna do Frozen/Disney) — desliga só o
+        // backfill por busca; o monitor de live normal usa o @handle exato e
+        // não sofre desse problema.
+        skipBackfillSearch: true,
+    },
+
     // ── Desativadas (re-ative movendo de volta para cima) ────────────────────
-    // Canal infantil pausado (2026-08-22): posts desligados enquanto um novo
-    // canal é planejado — capturar cortes do Luccas Neto sem destino gera
-    // trabalho/API à toa, por isso a persona sai da lista ativa (não só do
-    // rodízio do poster). Ver também CANALINFANTIL_IN_ROTATION=false no .env
-    // (geração por IA do Canal Infantil, já pausada antes por outro motivo).
-    // { name: 'lucasneto', displayName: 'Luccas Neto', platform: 'youtube', channelUrl: 'https://www.youtube.com/@luccasneto/videos', clipsPerRun: 5, videoOffset: 1, niche: 'infantil', weight: 1, youtubeProfileDir: process.env.CANALINFANTIL_PROFILE || './profiles/chrome-youtube-03', skipTikTok: true, madeForKids: true, uniformPeaksFallback: true },
     // { name: 'fontinele', displayName: 'Fontinele', platform: 'youtube', channelUrl: 'https://www.youtube.com/@OFontinele/videos', clipsPerRun: 5, videoOffset: 2, niche: 'podcast' },
     // { name: 'lubatv', displayName: 'LubaTV', platform: 'youtube', channelUrl: 'https://www.youtube.com/@LubaTV/videos', clipsPerRun: 5, videoOffset: 2, niche: 'react' },
     // { name: 'brino', displayName: 'Brino (BruninZor)', platform: 'twitch', channelUrl: 'bruninzor', youtubeUrl: null, clipsPerRun: 5, niche: 'gaming' },
