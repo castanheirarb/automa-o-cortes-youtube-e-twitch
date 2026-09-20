@@ -31,6 +31,14 @@ const execFileAsync = promisify(execFile);
 
 const TIMEOUT_MS = parseInt(process.env.VOCAL_ISOLATION_TIMEOUT_SEC || '600', 10) * 1000;
 const DEMUCS_MODEL = process.env.DEMUCS_MODEL || 'htdemucs';
+// Sem --segment o Demucs tenta processar o áudio inteiro de uma vez —
+// achado na prática (19/09/2026) com um vídeo de 112min (culto da
+// Congregação Cristã no Brasil): estourou memória (~9,4GB pedidos, falhou)
+// e caiu silenciosamente pro áudio original, perdendo a mitigação
+// exatamente nos vídeos mais longos. --segment processa em blocos com
+// overlap-add, mantendo o pico de memória limitado independente da duração
+// total do arquivo.
+const DEMUCS_SEGMENT_SECONDS = parseInt(process.env.DEMUCS_SEGMENT_SECONDS || '30', 10);
 
 function ffmpegBin() {
     return process.env.FFMPEG_PATH?.trim() || 'ffmpeg';
@@ -86,7 +94,9 @@ export async function isolateVocals(videoPath) {
 
         // 2. Separação de fontes — só o stem de voz interessa, o de música é descartado
         await execFileAsync(demucs, [
-            '--two-stems=vocals', '-n', DEMUCS_MODEL, '-o', tmpDir, tempWav,
+            '--two-stems=vocals', '-n', DEMUCS_MODEL,
+            '--segment', String(DEMUCS_SEGMENT_SECONDS),
+            '-o', tmpDir, tempWav,
         ], { timeout: TIMEOUT_MS, maxBuffer: 20 * 1024 * 1024 });
 
         const vocalsPath = path.join(tmpDir, DEMUCS_MODEL, 'audio', 'vocals.wav');
@@ -106,7 +116,12 @@ export async function isolateVocals(videoPath) {
         logger.success('[VocalIsolate] Música de fundo removida — áudio final só com a voz isolada.');
         return true;
     } catch (err) {
-        logger.warn(`[VocalIsolate] Falha ao isolar voz (${err.message}) — mantendo áudio original.`);
+        // err.message do execFile inclui stdout/stderr brutos — pra Demucs
+        // isso é a barra de progresso inteira (tqdm, atualizada via \r) em
+        // texto único. Os últimos ~200 caracteres já contêm o motivo real da
+        // falha (fim da barra + exceção, se houver) sem despejar tudo no log.
+        const shortReason = err.message.slice(-200).replace(/\s+/g, ' ').trim();
+        logger.warn(`[VocalIsolate] Falha ao isolar voz (...${shortReason}) — mantendo áudio original.`);
         try { if (fs.existsSync(tempOut)) fs.unlinkSync(tempOut); } catch { /* ignora */ }
         return false;
     } finally {
