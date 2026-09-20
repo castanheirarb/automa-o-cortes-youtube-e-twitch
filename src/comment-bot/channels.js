@@ -27,6 +27,13 @@ export const COMMENT_BOT_CHANNELS = [
     },
 ];
 
+// GTA VI (FOCONOGTAVI) removido em 19/09/2026: a API de Dados retorna
+// "account suspended" pra esse canal de forma persistente (não é o
+// invalid_grant genérico que afetou os outros 3 — upload via Playwright
+// segue funcionando normal, só o acesso via API que está bloqueado). Sem
+// solução conhecida ainda; reavaliar se o Google liberar de novo. Ver
+// memória project_gta6_youtube_suspended.
+
 export function getChannelByKey(key) {
     return COMMENT_BOT_CHANNELS.find((c) => c.key === key) ?? null;
 }

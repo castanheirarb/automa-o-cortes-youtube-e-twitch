@@ -55,8 +55,30 @@ const execFileAsync = promisify(execFile);
 //   ("Forrozinho do Céu"). Operação comercial grande, com o mesmo tipo de
 //   risco de música que gerou o strike original da Soares Music — não usar
 //   sem achar substituto de porte pequeno/médio e sem produção musical.
+//
+// Ampliação de 19/09/2026 — a pedido do usuário, priorizando IGREJAS (canal
+// oficial de instituição) em vez de pessoa física, mesma disciplina de
+// confirmação visual:
+// - Igreja da Cidade (@ictv.online): 141 mil inscritos, ativa diariamente,
+//   estava AO VIVO no momento da checagem, vídeos de 2-53min (cabem no filtro
+//   de duração padrão). Tem assinatura opcional (R$3,99/mês) mas é o modelo
+//   comum de apoiador de igreja, não produção comercial como o candidato
+//   descartado acima.
+// - Congregação Cristã no Brasil: 2,34 MILHÕES de inscritos, canal oficial da
+//   denominação, cultos ao vivo regulares (qua+dom, com variantes
+//   vídeo/áudio/Libras), sem assinatura paga, sem produção musical/comercial.
+//   Cultos duram ~1h22-1h53 — por isso LONG_VIDEO_FE_MAX_DURATION foi
+//   elevado pra 7200s (2h) no .env, senão esses vídeos nunca passariam no
+//   filtro padrão de 3600s.
+// Candidato rejeitado na mesma pesquisa: "TV Oração" (@TVOração) — inativo,
+// último vídeo com vários meses (não dá pra contar como fonte confiável).
 const PRAYER_LIVE_CHANNELS = [
     { url: 'https://www.youtube.com/@OracoesPoderosasOficial/videos', label: 'Orações Poderosas Oficial (Nivaldo Bildhauer)' },
+    { url: 'https://www.youtube.com/@ictv.online/videos', label: 'Igreja da Cidade (ICTV)' },
+    // /streams, não /videos — esse canal não expõe aba "Vídeos" padrão
+    // (yt-dlp retorna "This channel does not have a videos tab"); /streams
+    // funciona e lista os cultos ao vivo passados normalmente.
+    { url: 'https://www.youtube.com/channel/UC4cfCNEpwLIuYnxdDKUMPYg/streams', label: 'Congregação Cristã no Brasil' },
 ];
 
 const REGISTRY_FILE = path.resolve('./scheduler/long-video-fe-registry.json');
