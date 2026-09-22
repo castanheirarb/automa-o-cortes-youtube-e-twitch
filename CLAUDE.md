@@ -22,9 +22,11 @@ usuário (processos `node` de longa duração, sem deploy em nuvem):
 3. **Canal Infantil** — Shorts educativos infantis: cortes do Luccas Neto + vídeos gerados por IA
    (roteiro Groq + Pexels + Edge-TTS + FFmpeg, pipeline Python em `canal_infantil/`). Cortes ativos
    desde 19/09/2026 (conta `ferfertanus@hotmail.com`, suspensa em 07/09, teve o acesso confirmado de
-   volta via `poster/session-check.js`). Geração por IA segue desligada de propósito
-   (`CANALINFANTIL_IN_ROTATION=false` no `.env`) — reative ligando a flag quando decidirem retomar
-   esse lado também.
+   volta via `poster/session-check.js`). Vídeo longo diário próprio (`src/canal-infantil/long-video.js`,
+   mesmo padrão do Canal da Fé mas sem isolamento de voz — não se aplica ao conteúdo do Luccas Neto)
+   baixa um vídeo INTEIRO do canal oficial dele pra `output/longos-infantil`. Geração por IA (roteiro
+   próprio) segue desligada de propósito (`CANALINFANTIL_IN_ROTATION=false` no `.env`) — reative
+   ligando a flag quando decidirem retomar esse lado também.
 4. **GTA VI (FOCONOGTAVI)** — 4º canal dedicado (perfis `chrome-youtube-04`/`chrome-tiktok-04`),
    pré-lançamento do jogo (sai 19/11/2026): sem persona normal (ninguém joga ao vivo ainda), usa um
    Trend Hunter próprio (`src/trend-hunter/gta6-capture.js`) que vasculha canais BR de
@@ -227,6 +229,12 @@ Shorts em cada canal. Inscritos não precisa de escopo novo (já funciona com o 
 Bot); watch hours e views de Shorts precisam de `yt-analytics.readonly` (mesma reautorização do
 Revenue-Aware Rotation — reautorizar uma vez resolve os dois painéis de uma vez).
 
+`npm run audience` (`src/scheduler/audience-recent.js`) é um painel mais leve e independente: views/
+likes/comentários só dos ÚLTIMOS 3 vídeos publicados por canal, via YouTube Data API v3
+(`videos.list`), sem depender da Analytics API (desabilitada no projeto GCP atual). Roda também como
+serviço contínuo do `start.js` (`AUDIENCE_CHECK_HOURS`, padrão 3h) — custo de cota irrisório (~12
+unidades/rodada pros 4 canais).
+
 ### Padrão "registra antes de tentar" (anti-duplicata em caso de crash)
 
 Em todo lugar que publica algo irreversível — `poster/queue.js` (registries por plataforma:
@@ -270,6 +278,43 @@ baixa — nunca menciona a inferência ao usuário. Roda 1 passada/dia por padr�
 (`COMMENT_BOT_HOURS=24` em `start.js`), não polling contínuo. **`COMMENT_BOT_DRY_RUN` deve
 permanecer `true` até um teste manual explícito confirmar o tom da resposta** — sempre validar com
 `comment-bot:once` antes de mudar o prompt de voz de um canal.
+
+### Monitor de live do TikTok (`src/capturer/live-monitor-tiktok.js`, `src/platforms/tiktok-peaks.js`)
+
+Orientado a evento via WebSocket (`tiktok-live-connector`), não polling — assim que a sala entra "ao
+vivo" a captação já dispara. A mesma conexão que detecta o status recebe chat e gifts em tempo real;
+`tiktok-peaks.js` prioriza os clipes nas janelas de maior engajamento durante a gravação (gifts pesam
+mais que chat — é dinheiro de verdade, sinal de hype mais confiável que volume de mensagem). Sem
+chat/gift no período (sala silenciosa, live pequena), cai pra distribuição uniforme automaticamente.
+Personas TikTok não têm VOD arquivado — enquanto a live não acontece de novo,
+`src/trend-hunter/tiktok-persona-scout.js` faz backfill buscando no YouTube lives BRUTAS/completas
+que outros canais já re-hospedaram (ex.: Royal Clipes) e corta com o pipeline normal; nunca reaproveita
+um corte que outro canal já editou (filtro de duração mínima descarta clipes curtos de 60-100s de
+terceiros, só sobra live bruta/recap longo).
+
+### Segurança e confiabilidade de upload
+
+Camada adicionada em 2026-09-15 depois de um incidente real: 8 uploads automáticos do Instagram numa
+conta nova, em rajada de ~40min, travaram todos na tela "Compartilhando" (0 publicados) — suspeita é
+que digitação/clique com timing perfeito soma sinais de automação, e rajada de posts é o padrão mais
+óbvio de bot pra detecção de conta nova.
+- `poster/human-behavior.js` — digitação e cliques humanizados (via `ghost-cursor-playwright`),
+  compartilhado pelos 3 uploaders (YouTube/TikTok/Instagram). Não resolve rate-limit de verdade (conta
+  já sinalizada continua sinalizada), só evita adicionar sinais óbvios de bot.
+- `poster/upload-pacing.js` — intervalo mínimo forçado entre posts REAIS por plataforma,
+  independente do cron (`INSTAGRAM_MIN_INTERVAL_MIN` etc. no `.env`) — evita rajada mesmo quando
+  vários slots de cron caem perto um do outro (round-robin pulando de persona em persona rápido).
+- `poster/session-check.js` — validação de sessão ponta a ponta de cada conta ativa, rodada sempre
+  ANTES do cron do poster começar. Abre o perfil de verdade via Playwright e navega até o
+  Studio/Creator Center (mesma URL que o upload real usa) pra pegar sessão expirada, MFA pendente ou
+  conta suspensa antes do primeiro horário agendado tentar postar. Nunca lança — conta com sessão
+  inválida só gera aviso no log, as outras seguem normalmente.
+- `src/utils/gemini-quota-guard.js` — circuit breaker compartilhado pra cota diária do Gemini free
+  tier (20 req/dia/modelo). Sem isso, cada chamador (`metadata.js`, `content-optimizer`,
+  `face-detect.js`, `thumbnail.js`) descobria a cota estourada por conta própria, gastando round-trip +
+  retry do 429 em cada post pelo resto do dia (visto em produção em 06/09/2026). Uma vez que qualquer
+  chamador detecta o 429, todos pulam Gemini direto pro fallback (Groq/frame simples) por 24h de
+  cooldown fixo a partir da primeira detecção.
 
 ### Geração de metadados e legendas
 
