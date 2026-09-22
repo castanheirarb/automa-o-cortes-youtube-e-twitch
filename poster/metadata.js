@@ -20,6 +20,7 @@ import { validateAndLog, getRecentHashtagsForNiche } from './metadata-validator.
 import { sanitizeTranscript, sanitizeMetadataText } from './content-filter.js';
 import { getPersonaBranding } from './branding.js';
 import { PERSONAS_MAP } from '../src/capturer/personas.js';
+import { isGeminiQuotaExhausted, isGeminiQuotaError, markGeminiQuotaExhausted } from '../src/utils/gemini-quota-guard.js';
 
 // ─── BANCO DE FÓRMULAS VIRAIS (baseado em dados reais dos maiores canais) ────
 
@@ -64,6 +65,14 @@ const VIRAL_FORMULAS = {
         'SURPRESA: "OLHA O QUE ACONTECEU QUANDO [SITUAÇÃO]!"',
         'APRENDA BRINCANDO: "A FORMA MAIS DIVERTIDA DE APRENDER [TEMA]"',
     ],
+    gta6: [
+        'TEORIA: "O QUE [DETALHE] REVELA SOBRE GTA 6"',
+        'VOCÊ VIU ISSO? "[EASTER EGG/DETALHE] ESCONDIDO NO TRAILER DE GTA 6"',
+        'CONTAGEM REGRESSIVA: "FALTAM [X] DIAS PARA GTA 6 — O QUE JÁ SABEMOS"',
+        'COMPARAÇÃO: "GTA 5 VS GTA 6: TUDO QUE MUDOU"',
+        'VAZAMENTO: "[DETALHE] QUE A ROCKSTAR NÃO QUERIA QUE VOCÊ VISSE"',
+        'REAÇÃO: "[CRIADOR] NÃO ACREDITOU NO QUE VIU NO NOVO TRAILER"',
+    ],
     default: [
         'CURIOSIDADE: "VOCÊ SABIA QUE [FATO DO VÍDEO]?"',
         'IMPACTO: "A CENA QUE CHOCOU A TODOS NA LIVE"',
@@ -93,19 +102,27 @@ function buildCopyPrompt(niche, formulas, isLongVideo = false, recentHashtags = 
         ? `\nHASHTAGS JÁ USADAS RECENTEMENTE NESTE NICHO (evite repetir estas exatas — use sinônimos ou variações):\n${recentHashtags.join(' ')}\n`
         : '';
 
-    return `Copywriter de YouTube${isLongVideo ? '' : ' Shorts'}/TikTok. Gere metadados em JSON puro.
+    return `Você é uma pessoa de verdade que edita cortes pro canal e escreve o
+título/descrição rapidinho antes de postar — não um copywriter corporativo.
+Gere metadados em JSON puro.
 
 NICHO DO CANAL: ${niche}
 
-FÓRMULAS DE TÍTULO (escolha UMA e adapte ao conteúdo real da transcrição):
+ÂNGULOS POSSÍVEIS PARA ESSE NICHO (são ideias de ASSUNTO, não moldes de frase —
+leia a transcrição real e escreva do seu jeito, nunca "PALAVRA-CHAVE: frase entre aspas"
+toda vez; varie a estrutura da frase a cada título):
 ${formulas}
 ${antiRepeticaoHashtags}
-EXEMPLOS DE TÍTULOS DE SUCESSO (inspire-se no padrão, NÃO copie):
-- "SATANISMO É UM CAMINHO SEM VOLTA? | Cortes do Flow"
-- "MARINHO COMPROU A LOJA TODA EM DINHEIRO | Cortes do Flow"
-- "CASIMIRO REAGE: SHOW DO MILHÃO - PROERD É O PROGRAMA | Cortes do Casimito"
-- "SEI a VERDADE sobre GOLEIRO BRUNO e ELIZA SAMUDIO (Beto Ribeiro)"
-- "RENATO CARIANI REVELA O SEGREDO DA SUA DIETA"
+COMO SOA HUMANO (o que mais denuncia texto gerado por IA, evite):
+- Repetir a MESMA estrutura sempre (rótulo em caixa alta + dois-pontos + frase
+  entre aspas). Às vezes começa direto pela frase, às vezes é só uma pergunta
+  curta, às vezes é uma afirmação simples — varia de verdade.
+- Fechar a descrição sempre com a mesma frase de CTA ("Inscreva-se para mais!").
+  Só use um CTA de vez em quando, e quando usar, varia a palavra.
+- Exagerar em maiúscula, emoji ou pontuação pra parecer "mais chamativo" —
+  isso passa o oposto do que quer, parece bot. 1 palavra em destaque já basta.
+- Frases genéricas que serviriam pra qualquer vídeo do canal — seja específico
+  sobre o que REALMENTE acontece nesse clipe.
 
 REGRAS INVIOLÁVEIS:
 1. ZERO palavrões, xingamentos, ofensas, termos sexuais, violentos ou de ódio
@@ -116,14 +133,17 @@ REGRAS INVIOLÁVEIS:
 
 TÍTULO (campo "titulo"):
 - 40-70 caracteres
-- CAIXA ALTA em NO MÁXIMO 2-3 palavras-chave de maior impacto — o resto da
-  frase em minúsculas normais (título 100% em caixa alta é reprovado)
-- Máx 2 emojis, sem hashtags no título
-- Deve ter gatilho: pergunta, revelação, humor, surpresa ou tensão
+- Destaque NO MÁXIMO 1-2 palavras em caixa alta (às vezes ZERO — nem todo
+  título precisa) — o resto em minúsculas normais, como alguém digitaria rápido
+- Máx 2 emojis (bastante título bom não usa nenhum), sem hashtags no título
+- Precisa despertar curiosidade real sobre O QUE ACONTECE no clipe — pergunta,
+  detalhe específico, reação genuína — não um rótulo de categoria
 
 DESCRIÇÃO (campo "descricao"):
-- 1-2 frases que aprofundam o gancho, sem revelar o final
-- Termine com: "Inscreva-se para mais! 🎬"
+- 1-2 frases curtas que dão mais contexto sem entregar o final, como quem tá
+  comentando o clipe com um amigo
+- CTA de inscrição é OPCIONAL e deve variar quando usado — não repita "Inscreva-se
+  para mais! 🎬" sempre; às vezes não tem CTA nenhum
 - Máx 200 caracteres
 
 HASHTAGS (campo "hashtags"):
@@ -132,7 +152,7 @@ ${hashtagRules}
 
 TEXTO DA THUMBNAIL (campo "thumbText"):
 - 3-5 palavras em CAIXA ALTA que COMPLEMENTEM o título (NÃO repita o título)
-- Ex: Se título é "ELE REVELOU O SEGREDO", thumbText pode ser "NINGUÉM ESPERAVA"
+- Ex: Se título é "ele revelou o segredo", thumbText pode ser "NINGUÉM ESPERAVA"
 
 Responda APENAS com JSON válido:
 {"titulo":"...","descricao":"...",${hashtagExample},"thumbText":"..."}`;
@@ -166,7 +186,7 @@ export async function transcribeAudio(audioPath) {
     const groq = new Groq({ apiKey });
     const response = await groq.audio.transcriptions.create({
         file: fs.createReadStream(audioPath),
-        model: 'whisper-large-v3-turbo',
+        model: process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3-turbo',
         language: 'pt',
         response_format: 'text',
     });
@@ -179,15 +199,24 @@ export async function transcribeAudio(audioPath) {
 
 // ─── 3. Detecta persona e nicho a partir do caminho do vídeo ─────────────────
 
-// Personas virtuais dos canais gerados por IA (Canal da Fé, Canal Infantil)
-// vivem em src/canal-da-fe/generate.js e src/canal-infantil/generate.js —
-// arquivos separados que nunca entram em PERSONAS_MAP (só personas.js entra).
-// Na prática elas trazem sidecar .meta.json e pulam generateMetadata inteiro
-// (ver poster/index.js), então isto só importa no caminho de fallback (sidecar
-// ausente/corrompido) — mas sem isso o niche caía sempre em 'default'.
+// Personas virtuais (canais gerados por IA + Trend Hunters) vivem fora de
+// src/capturer/personas.js — em src/canal-da-fe/generate.js,
+// src/canal-infantil/generate.js, src/trend-hunter/trend-capture.js e
+// src/trend-hunter/gta6-capture.js — então nunca entram em PERSONAS_MAP (só
+// personas.js entra) e o niche delas (`persona.niche` no objeto da persona
+// virtual) é invisível pra generateMetadata, que só recebe o filePath e
+// redescobre o niche pelo NOME DA PASTA em output/. Canal da Fé/Infantil
+// escapam disso na prática (trazem sidecar .meta.json e pulam
+// generateMetadata inteiro — ver poster/index.js), então essa tabela só
+// importa pra eles no caminho de fallback (sidecar ausente/corrompido). Já os
+// Trend Hunters SEMPRE passam por aqui — sem a entrada correspondente, o
+// niche caía sempre em 'default' (fórmulas/hashtags genéricas, nunca as do
+// nicho real).
 const NICHE_OVERRIDE_BY_FOLDER = {
     canaldafe: 'religioso',
     canalinfantil: 'infantil',
+    trendhunter: 'podcast',
+    gta6hunter: 'gta6',
 };
 
 function getPersonaInfo(videoPath) {
@@ -327,11 +356,16 @@ async function generateCopyWithGroq(transcript, videoPath, isLongVideo = false) 
 
 export async function generateCopy(transcript, videoPath, isLongVideo = false) {
     const hasGemini = !!process.env.GEMINI_API_KEY?.trim();
-    if (hasGemini) {
+    if (hasGemini && !isGeminiQuotaExhausted()) {
         try {
             return await generateCopyWithGemini(transcript, videoPath, isLongVideo);
         } catch (err) {
-            logger.warn(`[Metadata] Gemini falhou: ${err.message} — tentando Groq...`);
+            if (isGeminiQuotaError(err)) {
+                markGeminiQuotaExhausted();
+                logger.warn('[Metadata] Cota diária do Gemini esgotada — usando Groq direto pelas próximas 24h.');
+            } else {
+                logger.warn(`[Metadata] Gemini falhou: ${err.message} — tentando Groq...`);
+            }
         }
     }
     return await generateCopyWithGroq(transcript, videoPath, isLongVideo);
@@ -398,6 +432,19 @@ export function formatTikTokCaption(metadata) {
         metadata.titulo.trim(),
         metadata.descricao.trim(),
         metadata.hashtags.trim(),
+    ].filter(Boolean);
+    return parts.join('\n\n').slice(0, 2200);
+}
+
+export function formatInstagramCaption(metadata) {
+    // Instagram premia hashtags mais enxutas/segmentadas que o TikTok (que aceita
+    // uma "chuva" de tags) — corta pras primeiras N em vez de usar todas geradas.
+    const maxHashtags = parseInt(process.env.INSTAGRAM_MAX_HASHTAGS || '8', 10);
+    const trimmedHashtags = metadata.hashtags.trim().split(/\s+/).filter(Boolean).slice(0, maxHashtags).join(' ');
+    const parts = [
+        metadata.titulo.trim(),
+        metadata.descricao.trim(),
+        trimmedHashtags,
     ].filter(Boolean);
     return parts.join('\n\n').slice(0, 2200);
 }

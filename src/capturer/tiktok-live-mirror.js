@@ -48,8 +48,30 @@ export function mirrorTikTokLive(username) {
         if (stopped) return;
 
         // Import dinâmico: mantém a dependência opcional até o módulo ser usado.
-        const { WebcastPushConnection } = await import('tiktok-live-connector');
-        connection = new WebcastPushConnection(username);
+        // WebcastPushConnection só existe no subpath /legacy na v2+ (a raiz do
+        // pacote exporta a nova TikTokLiveConnection) — importar da raiz aqui
+        // resolve undefined e quebra o "new" logo abaixo.
+        const { WebcastPushConnection } = await import('tiktok-live-connector/legacy');
+
+        const options = {};
+        if (process.env.EULERSTREAM_API_KEY) {
+            options.signApiKey = process.env.EULERSTREAM_API_KEY;
+        }
+        // Sessão de conta dedicada (opcional) — só ajuda a ver lives restritas
+        // (subscriber-only/idade); status/chat/gift públicos funcionam sem isso.
+        if (process.env.TIKTOK_SESSION_ID && process.env.TIKTOK_TT_TARGET_IDC) {
+            options.session = {
+                cookie: {
+                    type: 'cookie',
+                    value: {
+                        sessionId: process.env.TIKTOK_SESSION_ID,
+                        ttTargetIdc: process.env.TIKTOK_TT_TARGET_IDC,
+                    },
+                },
+            };
+        }
+
+        connection = new WebcastPushConnection(username, options);
 
         connection.on('streamEnd', () => {
             logger.info(`[TikTokMirror] @${username}: live encerrada.`);

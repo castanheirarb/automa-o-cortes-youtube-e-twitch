@@ -23,6 +23,11 @@ const PLATFORMS = {
         url: 'https://www.tiktok.com/login',
         name: 'TikTok',
     },
+    instagram: {
+        profileDir: path.resolve('./profiles/chrome-instagram'),
+        url: 'https://www.instagram.com/accounts/login/',
+        name: 'Instagram',
+    },
 };
 
 function waitForEnter(message) {
@@ -102,9 +107,11 @@ async function main() {
 
     const UPLOAD_YOUTUBE = process.env.UPLOAD_TO_YOUTUBE !== 'false';
     const UPLOAD_TIKTOK = process.env.UPLOAD_TO_TIKTOK !== 'false';
+    const UPLOAD_INSTAGRAM = process.env.UPLOAD_TO_INSTAGRAM !== 'false';
 
     if (UPLOAD_YOUTUBE) await loginToPlatform('youtube');
     if (UPLOAD_TIKTOK) await loginToPlatform('tiktok');
+    if (UPLOAD_INSTAGRAM) await loginToPlatform('instagram');
 
     logger.success('✅ Todos os logins concluídos!');
     logger.info('A partir de agora rode: npm run poster');

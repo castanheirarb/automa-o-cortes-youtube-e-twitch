@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## O que é este projeto
 
-Automação completa de 3 canais do YouTube (+ TikTok) rodando na máquina Windows do usuário
-(processos `node` de longa duração, sem deploy em nuvem):
+Automação completa de vários canais do YouTube (+ TikTok, + Bilibili) rodando na máquina Windows do
+usuário (processos `node` de longa duração, sem deploy em nuvem):
 
 1. **Canal principal** ("Corte Certo 034") — cortes de lives/VODs de 6 "personas" (streamers/criadores
    de YouTube e Twitch), escolhidos automaticamente pelo momento de maior audiência (heatmap/chat).
@@ -25,6 +25,28 @@ Automação completa de 3 canais do YouTube (+ TikTok) rodando na máquina Windo
    volta via `poster/session-check.js`). Geração por IA segue desligada de propósito
    (`CANALINFANTIL_IN_ROTATION=false` no `.env`) — reative ligando a flag quando decidirem retomar
    esse lado também.
+4. **GTA VI (FOCONOGTAVI)** — 4º canal dedicado (perfis `chrome-youtube-04`/`chrome-tiktok-04`),
+   pré-lançamento do jogo (sai 19/11/2026): sem persona normal (ninguém joga ao vivo ainda), usa um
+   Trend Hunter próprio (`src/trend-hunter/gta6-capture.js`) que vasculha canais BR de
+   análise/reação e corta o vídeo em alta. Teve 2 suspensões (04/09 revertida, boicote/denúncias em
+   massa 17/09 reativado 19/09 por decisão consciente do usuário mesmo sem confirmação de que o
+   boicote esfriou — ver `project_gta6_youtube_suspended` em memória). Comment Bot desse canal foi
+   **removido** (`src/comment-bot/channels.js`) — a API de Dados retorna "account suspended" de
+   forma persistente só pra esse canal, mesmo com upload via Playwright funcionando normal.
+5. **Bilibili** (`bilibili/`, projeto isolado) — canal mainland chinês, nunca entra no rodízio dos
+   canais acima. Upload via `biliup` (binário externo, autenticação por cookies), não Playwright —
+   Bilibili não tem API de upload pública utilizável. Clipa conteúdo viral chinês
+   (`bilibili/sources.js`) + repost automático dos cortes do canal principal e do A Fé Move
+   Montanhas + teste de conteúdo BR (`BILIBILI_BR_EXPERIMENT_RATE`). Agendamento próprio
+   (`npm run bilibili:schedule`, 4x/dia), painel de audiência (`npm run bilibili:stats`).
+
+**Subsistemas auxiliares** (não são canais, servem os de cima): **Agenda Esportiva / Sports Radar**
+(`src/capturer/sports-radar.js` + Watchdog, único ponto do projeto com banco de dados — Prisma/SQLite
+em `prisma/prisma/corte.db` — agenda jogos e minera VOD por pico de chat/gol); **Instagram**
+(`poster/uploaders/instagram.js`, Reels via Playwright) — pausado desde 15/09/2026 (8/8 tentativas
+automatizadas falharam, humanização adicionada depois, decisão de re-testar ainda pendente,
+`UPLOAD_TO_INSTAGRAM=false`); **OBS mirror** (`src/obs/`, `npm run obs:*`) — espelha a tela via
+OBS WebSocket pra uso em live, não afeta o pipeline de postagem.
 
 Cada canal publica sozinho, em horários fixos (cron), sem aprovação manual — geração de
 título/descrição/hashtags via IA (Gemini primário, Groq fallback), upload via Playwright
@@ -228,9 +250,19 @@ processos). Também existe uma trava de instância única do `start.js` inteiro
 ### Comment Bot (`src/comment-bot/`, `poster/comment-*.js`, `poster/youtube-oauth-setup.js`)
 
 Usa a YouTube Data API v3 diretamente (`googleapis`), não Playwright — é o único caminho do projeto
-que não depende de perfil de navegador. Cada canal tem seu próprio refresh token OAuth
-(`YOUTUBE_REFRESH_TOKEN_MAIN/_FE/_INFANTIL`, client id/secret compartilhados), gerado 1x via
-`poster/youtube-oauth-setup.js --channel <main|fe|infantil>`. Portão de segurança nos dois sentidos
+que não depende de perfil de navegador. Canais atendidos: `main`/`fe`/`infantil`
+(`src/comment-bot/channels.js`) — **GTA VI foi removido** dessa lista em 19/09/2026 porque a API de
+Dados retorna "account suspended" de forma persistente só pra esse canal (upload via Playwright não
+é afetado, só a resposta automática de comentário; reavaliar se o Google liberar de novo). Cada
+canal tem seu próprio refresh token OAuth (`YOUTUBE_REFRESH_TOKEN_MAIN/_FE/_INFANTIL`, client
+id/secret compartilhados), gerado via `poster/youtube-oauth-setup.js --channel <main|fe|infantil>`
+— **não é "gerado 1x e esquece"**: se o projeto OAuth no Google Cloud Console estiver em modo
+"Testing" (não publicado), os refresh tokens expiram sozinhos em ~7 dias mesmo sem revogação manual
+(achado nesta sessão: os 4 tokens — incluindo o do GTA VI, então em uso — estavam `invalid_grant` ao
+mesmo tempo). Nesse modo, cada conta Google usada também precisa estar na lista de "Test users" da
+tela de consentimento OAuth do projeto, senão a autorização é bloqueada antes mesmo de gerar o
+token. Ver `RESTORE.md` pra reautorizar os 3 canais do zero numa máquina nova. Portão de segurança
+nos dois sentidos
 (`poster/comment-safety.js`): classifica o comentário recebido (spam, crise, pedido de dados
 pessoais) antes de responder, e a resposta gerada antes de publicar. Inferência de gênero pelo nome
 (`src/comment-bot/gender.js`) via API do Censo do IBGE, com fallback neutro quando a confiança é
@@ -273,15 +305,24 @@ margem generosa de `max_tokens` (não o mínimo teórico do JSON esperado).
 ### Isolamento de voz (`src/processor/vocal-isolate.js`) — mitigação de copyright strike
 
 Separação de fontes de áudio via Demucs (`--two-stems=vocals`), aplicada automaticamente a todo
-conteúdo do nicho `religioso` (cortes do Bispo em `processClip`/ffmpeg.js e o vídeo longo em
+conteúdo do nicho `religioso` (cortes em `processClip`/ffmpeg.js e o vídeo longo em
 `src/canal-da-fe/long-video.js`) — mitigação técnica pro copyright strike de 2026-08-24 (Soares
-Music Digital): as lives de oração têm música de fundo ambiente que o Content ID reconhece mesmo
-sob a voz. Requer um venv Python **dedicado** (`voice_isolation/venv/`, PyTorch — não reaproveita o
-venv do MediaPipe/ASD) com `DEMUCS_PATH` apontando pro executável. Sem isso configurado, ou se o
-processo falhar/estourar o timeout (pesado em CPU — minutos por vídeo longo), cai de volta pro áudio
-original sem isolar, nunca quebra o pipeline. **Redução de risco, não garantia** — Content ID pode
-ainda pegar resíduo. Canal da Fé segue pausado (ver histórico de git/memória) até confirmação de que
-a mitigação funciona na prática.
+Music Digital): lives de oração têm música de fundo ambiente que o Content ID reconhece mesmo sob a
+voz. Requer um venv Python **dedicado** (`voice_isolation/venv/`, PyTorch — não reaproveita o venv
+do MediaPipe/ASD) com `DEMUCS_PATH` apontando pro executável. Sem isso configurado, ou se o processo
+falhar/estourar o timeout, cai de volta pro áudio original sem isolar, nunca quebra o pipeline.
+**Redução de risco, não garantia** — Content ID pode ainda pegar resíduo.
+
+`--segment` é sempre passado ao Demucs (`DEMUCS_SEGMENT_SECONDS`, default 7 — **não pode passar de
+7.8**, teto do próprio modelo `htdemucs`, que é um Transformer com contexto de treino fixo; valores
+maiores derrubam com "Cannot use a Transformer model with a longer segment than it was trained
+for"). Adicionado em 19/09/2026 depois de um vídeo de 112min pedir ~9,4GB e estourar memória sem
+segmentação — processar em blocos menores mantém o pico de memória limitado independente da duração
+do arquivo. Mesmo assim, **a máquina precisa ter RAM livre de verdade** — nessa sessão, com o
+sistema rodando só ~459MB livres de 16GB (várias outras apps abertas ao mesmo tempo: TikTok LIVE
+Studio, TikFinity, Chrome com muitas abas, outro agente de IA — ver seção de snapshot no fim deste
+arquivo), a isolação falhou mesmo segmentada (pediu só ~1,18GB e não coube). Se um vídeo longo
+publicar sem a mitigação aplicada, checar RAM livre antes de suspeitar de bug no código.
 
 ### Sub-projetos Python (`canal_da_fe/`, `canal_infantil/`)
 

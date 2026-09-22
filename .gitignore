@@ -22,6 +22,7 @@ scheduler/*.lock
 # Scratch pessoal (scripts de teste manual, não fazem parte do pipeline real)
 scratch-*.log
 ver5.mjs
+_*.mjs
 
 # Agenda Esportiva (Prisma/SQLite) — banco local, não versionar
 prisma/prisma/
@@ -32,6 +33,21 @@ prisma/prisma/
 /poster-error-*.png
 /poster-ambiguous-*.png
 /poster-warning-*.png
+/poster-debug-modal-*.png
+/bilibili-*.png
+/bilibili-global-*.png
+/qrcode.png
+/download.log
+
+# Ferramentas do editor/agente e artefatos de sync externos — nunca fazem
+# parte do código-fonte do projeto
+.claude/
+.tmp.drivedownload/
+.tmp.driveupload/
+
+# Vídeos já postados arquivados localmente (não histórico de código, mídia
+# pesada — 2GB+) — se quiser manter, faça backup manual fora do git
+archive/
 
 # Isolamento de voz (Demucs)
 voice_isolation/venv/
@@ -39,6 +55,7 @@ voice_isolation/venv/
 # Canal da Fé (subprojeto Python/Remotion)
 canal_da_fe/venv/
 canal_da_fe/browser_profile/
+canal_da_fe/browser_profile-*/
 canal_da_fe/token.json
 canal_da_fe/client_secrets.json
 canal_da_fe/assets/
@@ -50,6 +67,11 @@ canal_da_fe/.env
 canal_da_fe/video/public/audio.mp3
 canal_da_fe/video/public/metadata.json
 canal_da_fe/video/public/images/
+
+# Bilibili (projeto à parte, isolado — ver bilibili/): output/ e profiles/
+# já cobertos pelas regras genéricas acima, mas o registry anti-duplicata
+# (bilibili/state/*.json) é específico daqui.
+bilibili/state/
 
 # Canal Infantil (subprojeto Python)
 canal_infantil/venv/

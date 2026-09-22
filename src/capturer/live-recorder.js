@@ -1,6 +1,6 @@
 // src/capturer/live-recorder.js
-// Grava um segmento de live stream da Twitch usando yt-dlp.
-// Executa por LIVE_CAPTURE_MINUTES minutos e depois encerra.
+// Grava um segmento de live stream (Twitch, TikTok, ...) usando yt-dlp.
+// Executa por N minutos e depois encerra.
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -14,22 +14,26 @@ function getYtDlpBin() {
 }
 
 /**
- * Grava N minutos de um stream ao vivo da Twitch via yt-dlp.
+ * Grava N minutos de um stream ao vivo via yt-dlp (qualquer extractor suportado:
+ * Twitch, TikTok live, etc — o que muda é só a URL).
  *
- * @param {string} channel       - Username do canal (ex: 'alanzoka')
- * @param {number} minutesToRecord - Quantos minutos gravar (de LIVE_CAPTURE_MINUTES)
+ * @param {object} params
+ * @param {string} params.url              - URL da live (ex: https://www.twitch.tv/x, https://www.tiktok.com/@x/live)
+ * @param {string} params.label            - Nome curto pra logs/nome de arquivo (ex: username do canal)
+ * @param {number} [params.minutesToRecord=30] - Quantos minutos gravar
+ * @param {string} [params.cookiesPath]    - Caminho pra um cookies.txt (formato Netscape) — opcional,
+ *                                            só necessário se a live exigir sessão logada.
  * @returns {Promise<{ filePath: string, durationSec: number }>}
  */
-export async function recordLiveStream(channel, minutesToRecord = 30) {
+export async function recordLiveStream({ url, label, minutesToRecord = 30, cookiesPath }) {
     fs.mkdirSync(TMP_DIR, { recursive: true });
 
     const timestamp = Date.now();
-    const outFile = path.join(TMP_DIR, `live-${channel}-${timestamp}.mp4`);
-    const streamUrl = `https://www.twitch.tv/${channel}`;
+    const outFile = path.join(TMP_DIR, `live-${label}-${timestamp}.mp4`);
     const durationSec = minutesToRecord * 60;
     const ytDlp = getYtDlpBin();
 
-    logger.step(`[Recorder] Gravando ${minutesToRecord} min de twitch.tv/${channel}...`);
+    logger.step(`[Recorder] Gravando ${minutesToRecord} min de ${url}...`);
     logger.info(`[Recorder] Saída: ${outFile}`);
 
     return new Promise((resolve, reject) => {
@@ -46,8 +50,13 @@ export async function recordLiveStream(channel, minutesToRecord = 30) {
             '--no-part',
             '--quiet',
             '--progress',
-            streamUrl,
         ];
+
+        if (cookiesPath && fs.existsSync(cookiesPath)) {
+            args.push('--cookies', cookiesPath);
+        }
+
+        args.push(url);
 
         const proc = spawn(ytDlp, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -56,7 +65,7 @@ export async function recordLiveStream(channel, minutesToRecord = 30) {
         proc.stdout.on('data', (d) => {
             // Log de progresso a cada 30s (evita flood)
             if (Date.now() - lastLog > 30000) {
-                logger.info(`[Recorder] gravando ${channel}...`);
+                logger.info(`[Recorder] gravando ${label}...`);
                 lastLog = Date.now();
             }
         });

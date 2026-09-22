@@ -38,7 +38,12 @@ const DEMUCS_MODEL = process.env.DEMUCS_MODEL || 'htdemucs';
 // exatamente nos vídeos mais longos. --segment processa em blocos com
 // overlap-add, mantendo o pico de memória limitado independente da duração
 // total do arquivo.
-const DEMUCS_SEGMENT_SECONDS = parseInt(process.env.DEMUCS_SEGMENT_SECONDS || '30', 10);
+// Teto de 7 (não pode passar de 7.8): o modelo padrão (htdemucs) é um
+// Transformer híbrido com contexto máximo fixo de treino — Demucs rejeita
+// --segment acima de 7.8s pra esse modelo ("Cannot use a Transformer model
+// with a longer segment than it was trained for"), erro só descoberto
+// tentando 30s. Não é um limite de hardware, é do modelo em si.
+const DEMUCS_SEGMENT_SECONDS = parseInt(process.env.DEMUCS_SEGMENT_SECONDS || '7', 10);
 
 function ffmpegBin() {
     return process.env.FFMPEG_PATH?.trim() || 'ffmpeg';

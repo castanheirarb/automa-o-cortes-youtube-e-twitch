@@ -9,6 +9,7 @@
 //   5. addCaptionsToClip adiciona legendas automáticas
 
 import ffmpeg from 'fluent-ffmpeg';
+import sharp from 'sharp';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +34,19 @@ export class SubscriberOnlyError extends Error {
     constructor(message) {
         super(message);
         this.name = 'SubscriberOnlyError';
+    }
+}
+
+/**
+ * Lançado quando a janela do clipe é uma imagem estática (ver
+ * isStaticClipWindow) — capturado pelo capturer.js pra abortar os clipes
+ * restantes do MESMO vídeo-fonte (se um pico é estático, o vídeo inteiro
+ * provavelmente é, então tentar os outros picos só repete o mesmo resultado).
+ */
+export class StaticClipError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'StaticClipError';
     }
 }
 
@@ -118,6 +132,108 @@ async function getStreamUrls(videoUrl) {
         videoStreamUrl: lines[0],
         audioStreamUrl: lines[1] || null,
     };
+}
+
+// ─── Detecção de clipe estático (imagem parada + áudio) ──────────────────────
+// Descoberto em 09/09/2026: a série "NIGHT_PRAYER"/"MIDNIGHT_PRAYER" do canal
+// do Bispo Bruno Leonardo é uma imagem de IA parada com áudio de oração por
+// cima (só a legenda muda de frame a frame) — postado no TikTok como Short,
+// visualmente é só uma imagem.
+//
+// Primeira tentativa checava o vídeo-fonte INTEIRO por amostragem (2, depois
+// 5 pontos espalhados pela duração) — deu falso positivo em vídeo real: esses
+// vídeos religiosos costumam ter uma tela de título estática por um trecho
+// longo antes do conteúdo filmado de verdade (mãos/bíblia) aparecer só numa
+// janela específica, então amostras espalhadas pela duração INTEIRA podiam
+// cair todas fora dessa janela (reproduzido com "PODEROSA_ORAÇÃO_DO_SALMO_91",
+// que É real mas tem tela de título dominando a maior parte do vídeo). A
+// checagem certa é só na JANELA do clipe que vai ser cortado de verdade
+// (peakTime ± buffer) — muito mais curta, então poucas amostras já bastam
+// pra caracterizar ela corretamente.
+
+async function grabFrameBuffer(streamUrl, timestampSec) {
+    const ffmpegPath = process.env.FFMPEG_PATH?.trim() || 'ffmpeg';
+    const tmpPath = path.join(os.tmpdir(), `static-check-${crypto.randomBytes(4).toString('hex')}.jpg`);
+    try {
+        await execFileAsync(ffmpegPath, [
+            '-ss', String(Math.max(0, timestampSec)),
+            '-i', streamUrl,
+            '-frames:v', '1',
+            '-q:v', '4',
+            '-y',
+            tmpPath,
+        ], { timeout: 20000 });
+        if (!fs.existsSync(tmpPath)) return null;
+        return await sharp(tmpPath).resize(48, 48).grayscale().raw().toBuffer();
+    } catch {
+        return null;
+    } finally {
+        fs.unlink(tmpPath, () => {});
+    }
+}
+
+function maxPairwiseDiff(buffers) {
+    let max = 0;
+    for (let i = 0; i < buffers.length; i++) {
+        for (let j = i + 1; j < buffers.length; j++) {
+            const a = buffers[i], b = buffers[j];
+            if (!a || !b || a.length !== b.length) continue;
+            let diffSum = 0;
+            for (let k = 0; k < a.length; k++) diffSum += Math.abs(a[k] - b[k]);
+            max = Math.max(max, diffSum / a.length);
+        }
+    }
+    return max;
+}
+
+/**
+ * Detecta se a JANELA específica de um clipe (não o vídeo inteiro) é, na
+ * prática, uma imagem estática — amostra 4 frames dentro de [startTime,
+ * endTime] e compara todos os pares entre si. Só considera estático se NENHUM
+ * par difere (a janela inteira do clipe nunca muda). Nunca lança: falha na
+ * checagem deixa passar, não bloqueia a captura por causa de uma verificação
+ * extra.
+ * @param {string} videoStreamUrl - URL já resolvida (ver getStreamUrls)
+ * @param {number} startTime
+ * @param {number} endTime
+ * @returns {Promise<boolean>}
+ */
+export async function isStaticClipWindow(videoStreamUrl, startTime, endTime) {
+    const span = endTime - startTime;
+    if (!(span > 3)) return false; // janela curta demais pra amostrar com confiança
+    try {
+        const points = [0.1, 0.4, 0.6, 0.9].map((f) => startTime + span * f);
+        const buffers = await Promise.all(points.map((t) => grabFrameBuffer(videoStreamUrl, t)));
+
+        const validCount = buffers.filter(Boolean).length;
+        if (validCount < 2) {
+            // Achado em produção (16-17/09): esse retorno falhava ABERTO em
+            // silêncio total (sem log nenhum) — indistinguível de "check passou,
+            // não é estático". Pelo menos 15 clipes do Bispo (NIGHT_PRAYER de
+            // 02/09, 06/09 e 07/09 — o último 5 dias DEPOIS do fix original
+            // deste arquivo) eram imagem estática de verdade (diff real ~0.18,
+            // limiar é <3) e foram publicados no YouTube E no TikTok sem
+            // nenhum aviso no log. Log explícito aqui não corrige a causa raiz
+            // (por que grabFrameBuffer não conseguiu >=2 amostras válidas pra
+            // essa fonte específica — hipótese: URL de stream do yt-dlp exige
+            // headers/formato que o ffmpeg direto não reproduz), mas torna a
+            // próxima ocorrência visível no log em vez de descoberta só quando
+            // o usuário reportar "tá postando só imagem" dias depois.
+            logger.warn(`[FFmpeg] Checagem de imagem estática inconclusiva (só ${validCount}/4 amostras válidas) — seguindo SEM essa proteção pra esta janela.`);
+            return false;
+        }
+
+        const maxDiff = maxPairwiseDiff(buffers); // 0-255
+
+        const isStatic = maxDiff < 3;
+        if (isStatic) {
+            logger.warn(`[FFmpeg] Clipe é imagem estática (maior diff entre amostras: ${maxDiff.toFixed(2)}/255) — sem motion real, descartando.`);
+        }
+        return isStatic;
+    } catch (err) {
+        logger.warn(`[FFmpeg] Checagem de imagem estática falhou (${err.message}) — seguindo sem essa proteção.`);
+        return false;
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -267,15 +383,28 @@ function runAsdPython(videoPath, cmdsPath) {
 
         const proc = spawn(pythonPath, [scriptPath, videoPath, cmdsPath], {
             stdio: ['ignore', 'pipe', 'pipe'],
+            // Suprime ruído de biblioteca (TensorFlow Lite/absl/protobuf) na
+            // origem — sem isso, cada clipe imprimia ~8 linhas de aviso interno
+            // (XNNPACK delegate, "Feedback manager requires...", deprecation do
+            // protobuf) que não dizem nada sobre o resultado real do ASD.
+            env: { ...process.env, TF_CPP_MIN_LOG_LEVEL: '3', GLOG_minloglevel: '3', PYTHONWARNINGS: 'ignore' },
         });
+
+        // Filtro defensivo: mesmo com as env vars acima, alguma lib pode
+        // logar direto por conta própria — descarta padrões conhecidos de
+        // ruído de biblioteca, deixa passar linhas reais do script ([ASD] ...)
+        // e qualquer erro/traceback genuíno.
+        const NOISE_PATTERNS = /XNNPACK delegate|absl::InitializeLog|inference_feedback_manager|SymbolDatabase\.GetPrototype|warnings\.warn\(/;
 
         proc.stdout.on('data', (d) => {
             for (const line of d.toString().split('\n').filter(Boolean)) {
+                if (NOISE_PATTERNS.test(line)) continue;
                 logger.info(line);
             }
         });
         proc.stderr.on('data', (d) => {
             for (const line of d.toString().split('\n').filter(Boolean)) {
+                if (NOISE_PATTERNS.test(line)) continue;
                 logger.warn(line);
             }
         });
@@ -464,7 +593,7 @@ function runFfmpegCut(videoStreamUrl, audioStreamUrl, startTime, endTime, output
                 `-t ${duration}`,
             ])
             .output(outputPath)
-            .on('start', (cmdLine) => logger.info(`[FFmpeg] ${cmdLine.slice(0, 200)}`))
+            .on('start', () => logger.info('[FFmpeg] Re-encode (crop 9:16) iniciado.'))
             .on('progress', (p) => {
                 if (p.percent) process.stdout.write(`\r  ⏳ ${Math.min(p.percent, 100).toFixed(1)}%   `);
             })
@@ -708,7 +837,7 @@ export function runFfmpegSplitScreen(podcastPath, gameplayPath, outputPath, dura
                 '-avoid_negative_ts make_zero',
             ])
             .output(outputPath)
-            .on('start', (cmdLine) => logger.info(`[FFmpeg/SplitScreen2] ${cmdLine.slice(0, 220)}`))
+            .on('start', () => logger.info('[FFmpeg/SplitScreen2] Encode iniciado.'))
             .on('progress', (p) => {
                 if (p.percent) process.stdout.write(`\r  ⏳ ${Math.min(p.percent, 100).toFixed(1)}%   `);
             })
@@ -888,6 +1017,15 @@ export async function processClip(peakData, clipIndex = 1, totalClips = 1) {
     if (clipDurationSec < minClipSec) {
         throw new Error(
             `Clipe muito curto (${clipDurationSec.toFixed(1)}s < ${minClipSec}s) — pico a ${peakTime.toFixed(0)}s, na borda do vídeo.`
+        );
+    }
+
+    // Guarda contra vídeo-fonte que é só uma imagem parada com áudio por cima
+    // (ver StaticClipError acima) — checa a janela real deste clipe, não o
+    // vídeo inteiro.
+    if (await isStaticClipWindow(videoStreamUrl, startTime, endTime)) {
+        throw new StaticClipError(
+            `Janela do clipe (${startTime.toFixed(0)}s-${endTime.toFixed(0)}s) é imagem estática, sem motion real — "${title}".`
         );
     }
 
@@ -1198,7 +1336,7 @@ export function concatLocalClips(filePaths, outputPath) {
  * @param {string} [title]       - Nome usado na subpasta e no arquivo de saída
  * @returns {Promise<string>}    - Caminho absoluto do arquivo 9:16 processado
  */
-export async function processLocalClip(inputPath, outputBaseDir, title = 'clip') {
+export async function processLocalClip(inputPath, outputBaseDir, title = 'clip', captionOpts = {}) {
     const outputDir = path.join(path.resolve(outputBaseDir), sanitizeFilename(title));
     ensureOutputDir(outputDir);
 
@@ -1209,7 +1347,7 @@ export async function processLocalClip(inputPath, outputBaseDir, title = 'clip')
 
     const blurFilter = buildBlurredBackgroundFilter();
     await runFfmpegEncode(inputPath, outputPath, blurFilter, true, duration);
-    await addCaptionsToClip(outputPath, { niche: 'default', layout: 'blur' });
+    await addCaptionsToClip(outputPath, { niche: 'default', layout: 'blur', ...captionOpts });
 
     logger.success(`[FFmpeg/Local] Pronto: ${path.basename(outputPath)}`);
     return outputPath;

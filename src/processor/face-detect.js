@@ -3,12 +3,126 @@
 // usando Gemini 2.5 Pro Vision para determinar o enquadramento ideal do crop 9:16.
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import Groq from 'groq-sdk';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { logger } from '../utils/logger.js';
+import { isGeminiQuotaExhausted, isGeminiQuotaError, markGeminiQuotaExhausted } from '../utils/gemini-quota-guard.js';
+
+// Fallback de VISÃO quando o Gemini falha/esgota cota. IMPORTANTE (checado
+// direto contra GET /v1/models da Groq em 18/09/2026): a conta Groq deste
+// projeto NÃO tem nenhum modelo com visão disponível hoje — nem
+// meta-llama/llama-4-scout-17b-16e-instruct nem qwen/qwen3-vl-32b-instruct
+// (ambos sugeridos por pesquisa, mas retornam 404 model_not_found nesta
+// conta). Esse bloco fica pronto pra quando/se a Groq liberar visão pra essa
+// conta (ou definir GROQ_VISION_MODEL no .env com o nome certo) — até lá,
+// falha rápido e cai pro fallback burro de frame fixo, sem quebrar nada.
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+
+async function askGroqForBestFrameIndex(frames) {
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) return null;
+
+    const groq = new Groq({ apiKey });
+    const content = [
+        {
+            type: 'text',
+            text: `Analise as ${frames.length} imagens. Qual delas (de 0 a ${frames.length - 1}) tem a expressão facial mais forte e chamativa para uma thumbnail de YouTube Shorts? Responda APENAS com o número do índice.`,
+        },
+        ...frames.map((f) => ({
+            type: 'image_url',
+            image_url: { url: `data:image/jpeg;base64,${f.base64}` },
+        })),
+    ];
+
+    const completion = await groq.chat.completions.create({
+        model: GROQ_VISION_MODEL,
+        max_tokens: 20,
+        temperature: 0.3,
+        messages: [{ role: 'user', content }],
+    });
+
+    const raw = completion.choices[0]?.message?.content?.trim() ?? '';
+    const bestIndex = parseInt(raw, 10);
+    return isNaN(bestIndex) || bestIndex < 0 || bestIndex >= frames.length ? null : bestIndex;
+}
+
+// Terceiro nível de fallback de visão: OpenRouter. Modelos confirmados direto
+// no catálogo público (GET https://openrouter.ai/api/v1/models, sem precisar
+// de chave pra listar) em 18/09/2026 — reais e gratuitos hoje, ao contrário do
+// que pesquisa anterior sugeriu (qwen2.5-vl-32b-instruct:free NÃO existe).
+// Exige OPENROUTER_API_KEY própria (conta separada da Groq/Gemini) — sem ela,
+// esse nível simplesmente não entra, sem erro.
+//
+// DOIS modelos, não um: testado ao vivo em 18/09/2026, o primeiro (Gemma) deu
+// 429 "temporarily rate-limited upstream" — normal em modelo ":free" (pool
+// compartilhado entre todos os usuários da OpenRouter, não é erro nosso).
+// Sem um segundo modelo de reserva, esse nível inteiro cairia pro fallback
+// burro só por congestionamento passageiro de UM modelo específico.
+// Se OPENROUTER_VISION_MODEL estiver setada, ela entra PRIMEIRO na lista (dá
+// prioridade à escolha manual) — mas sem SUBSTITUIR a lista de reserva, senão
+// perde o ponto inteiro de ter um 2º modelo (bug real: definir a env var pra
+// documentar o padrão no .env acabava reduzindo a lista pra 1 item só).
+const OPENROUTER_VISION_MODELS = [
+    ...(process.env.OPENROUTER_VISION_MODEL ? [process.env.OPENROUTER_VISION_MODEL] : []),
+    'google/gemma-4-31b-it:free',
+    'inclusionai/ling-3.0-flash-vl:free',
+].filter((m, i, arr) => arr.indexOf(m) === i); // remove duplicata se a env var repetir o default
+
+async function callOpenRouterVision(model, content) {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json',
+        },
+        // max_tokens generoso: mesmo bug clássico já visto com gpt-oss-120b no
+        // resto do projeto (ver CLAUDE.md) — modelos "thinking" (ex.: o
+        // inclusionai/ling-3.0-flash-vl:free gastou 20/20 tokens todos em
+        // raciocínio oculto e nunca chegou a responder, finish_reason:
+        // "length", content: null, confirmado ao vivo em 18/09/2026) cortam
+        // no meio do pensamento com um limite baixo.
+        body: JSON.stringify({ model, max_tokens: 200, temperature: 0.3, messages: [{ role: 'user', content }] }),
+    });
+    if (!res.ok) throw new Error(`OpenRouter (${model}) ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    return res.json();
+}
+
+async function askOpenRouterForBestFrameIndex(frames) {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) return null;
+
+    const content = [
+        {
+            type: 'text',
+            text: `Analise as ${frames.length} imagens. Qual delas (de 0 a ${frames.length - 1}) tem a expressão facial mais forte e chamativa para uma thumbnail de YouTube Shorts? Responda APENAS com o número do índice.`,
+        },
+        ...frames.map((f) => ({
+            type: 'image_url',
+            image_url: { url: `data:image/jpeg;base64,${f.base64}` },
+        })),
+    ];
+
+    let data = null;
+    let lastErr = null;
+    for (const model of OPENROUTER_VISION_MODELS) {
+        try {
+            data = await callOpenRouterVision(model, content);
+            break;
+        } catch (err) {
+            lastErr = err;
+            logger.warn(`[FaceDetect] ${err.message} — tentando próximo modelo OpenRouter...`);
+        }
+    }
+    if (!data) throw lastErr || new Error('Nenhum modelo OpenRouter respondeu.');
+
+    const raw = data.choices?.[0]?.message?.content?.trim() ?? '';
+    const bestIndex = parseInt(raw, 10);
+    return isNaN(bestIndex) || bestIndex < 0 || bestIndex >= frames.length ? null : bestIndex;
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -64,8 +178,8 @@ async function askGeminiForFacePosition(framePath) {
  * Amostra múltiplos frames e usa a média das detecções.
  */
 export async function detectCropXPosition(videoStreamUrl, startTime, endTime) {
-    if (!process.env.GEMINI_API_KEY) {
-        logger.warn('face-detect: GEMINI_API_KEY não configurada — usando centro (0.5).');
+    if (!process.env.GEMINI_API_KEY || isGeminiQuotaExhausted()) {
+        logger.warn('face-detect: Gemini indisponível (sem chave ou cota esgotada) — usando centro (0.5).');
         return 0.5;
     }
 
@@ -87,6 +201,7 @@ export async function detectCropXPosition(videoStreamUrl, startTime, endTime) {
                 logger.info(`  frame em ${Math.floor(t)}s → rosto em X=${(pos * 100).toFixed(0)}%`);
             }
         } catch (err) {
+            if (isGeminiQuotaError(err)) markGeminiQuotaExhausted();
             logger.warn(`  frame em ${Math.floor(t)}s → erro: ${err.message}`);
         } finally {
             if (framePath && fs.existsSync(framePath)) fs.unlinkSync(framePath);
@@ -110,11 +225,6 @@ export async function detectCropXPosition(videoStreamUrl, startTime, endTime) {
  * @returns {Promise<string|null>} Caminho do frame salvo ou null
  */
 export async function extractBestFrame(videoPath) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) return null;
-
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.5-flash' });
     const ffmpegPath = process.env.FFMPEG_PATH?.trim() || 'ffmpeg';
 
     const duration = 60; // Analisa os primeiros 60s
@@ -136,35 +246,71 @@ export async function extractBestFrame(videoPath) {
 
     if (frames.length === 0) return null;
 
-    try {
-        // 2. Envia para o Gemini Vision avaliar
-        const parts = [
-            ...frames.map((f) => ({
-                inlineData: { data: f.base64, mimeType: 'image/jpeg' },
-            })),
-            {
-                text: `Analise as ${frames.length} imagens. Qual delas (de 0 a ${frames.length - 1}) tem a expressão facial mais forte e chamativa para uma thumbnail de YouTube Shorts? Responda APENAS com o número do índice (${Array.from({ length: frames.length }, (_, i) => i).join(', ')}).`,
-            },
-        ];
+    let safeIndex = null;
 
-        const result = await model.generateContent(parts);
-        const bestIndex = parseInt(result.response.text().trim(), 10);
-        const safeIndex = isNaN(bestIndex) || bestIndex >= frames.length ? 0 : bestIndex;
-        const bestFrame = frames[safeIndex];
+    // 2. Gemini primeiro (melhor qualidade histórica), se disponível.
+    if (process.env.GEMINI_API_KEY && !isGeminiQuotaExhausted()) {
+        try {
+            const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+            const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.5-flash' });
+            const parts = [
+                ...frames.map((f) => ({ inlineData: { data: f.base64, mimeType: 'image/jpeg' } })),
+                {
+                    text: `Analise as ${frames.length} imagens. Qual delas (de 0 a ${frames.length - 1}) tem a expressão facial mais forte e chamativa para uma thumbnail de YouTube Shorts? Responda APENAS com o número do índice (${Array.from({ length: frames.length }, (_, i) => i).join(', ')}).`,
+                },
+            ];
+            const result = await model.generateContent(parts);
+            const bestIndex = parseInt(result.response.text().trim(), 10);
+            safeIndex = isNaN(bestIndex) || bestIndex >= frames.length ? 0 : bestIndex;
+            logger.info(`[FaceDetect] Melhor frame selecionado pelo Gemini: índice ${safeIndex}`);
+        } catch (err) {
+            if (isGeminiQuotaError(err)) markGeminiQuotaExhausted();
+            logger.warn(`[FaceDetect] Gemini Vision falhou: ${err.message} — tentando Groq Vision...`);
+        }
+    }
 
-        // 3. Limpa frames não utilizados
-        frames.forEach((f, i) => {
-            if (i !== safeIndex && fs.existsSync(f.path)) fs.unlinkSync(f.path);
-        });
+    // 3. Groq Vision (mesma chave já usada pra Whisper/copy no projeto) —
+    // fallback de visão real, não o fallback burro (frame fixo) que existia
+    // antes disso aqui. Cota Groq (14.400 req/dia) sobra MUITO pro volume de
+    // thumbnail — só entra quando Gemini falha ou está sem cota.
+    if (safeIndex === null) {
+        try {
+            const groqIndex = await askGroqForBestFrameIndex(frames);
+            if (groqIndex !== null) {
+                safeIndex = groqIndex;
+                logger.info(`[FaceDetect] Melhor frame selecionado pelo Groq (${GROQ_VISION_MODEL}): índice ${safeIndex}`);
+            }
+        } catch (err) {
+            logger.warn(`[FaceDetect] Groq Vision também falhou: ${err.message}`);
+        }
+    }
 
-        logger.info(`[FaceDetect] Melhor frame selecionado pelo Gemini: índice ${safeIndex}`);
-        return bestFrame.path;
+    // 4. OpenRouter (conta/chave separada) — terceiro nível, só entra se
+    // Gemini E Groq falharem/estiverem indisponíveis.
+    if (safeIndex === null) {
+        try {
+            const orIndex = await askOpenRouterForBestFrameIndex(frames);
+            if (orIndex !== null) {
+                safeIndex = orIndex;
+                logger.info(`[FaceDetect] Melhor frame selecionado pelo OpenRouter (${OPENROUTER_VISION_MODEL}): índice ${safeIndex}`);
+            }
+        } catch (err) {
+            logger.warn(`[FaceDetect] OpenRouter Vision também falhou: ${err.message}`);
+        }
+    }
 
-    } catch (err) {
-        logger.warn(`[FaceDetect] Gemini Vision falhou: ${err.message}`);
+    // 5. Sem IA nenhuma disponível: mantém o comportamento antigo (deixa
+    // thumbnail.js cair pro extractFallbackFrame — frame fixo em 1/3 do vídeo).
+    if (safeIndex === null) {
         frames.forEach((f) => { if (fs.existsSync(f.path)) fs.unlinkSync(f.path); });
         return null;
     }
+
+    const bestFrame = frames[safeIndex];
+    frames.forEach((f, i) => {
+        if (i !== safeIndex && fs.existsSync(f.path)) fs.unlinkSync(f.path);
+    });
+    return bestFrame.path;
 }
 
 // ─── Classificação de cena → layout automático ───────────────────────────────
@@ -214,8 +360,8 @@ async function classifyFrame(framePath) {
  * @returns {Promise<'asd'|'hybrid'>}
  */
 export async function detectSceneLayout(videoStreamUrl, startTime, endTime) {
-    if (!process.env.GEMINI_API_KEY) {
-        logger.warn('[SceneDetect] GEMINI_API_KEY ausente — mantendo layout padrão (asd).');
+    if (!process.env.GEMINI_API_KEY || isGeminiQuotaExhausted()) {
+        logger.warn('[SceneDetect] Gemini indisponível (sem chave ou cota esgotada) — mantendo layout padrão (asd).');
         return 'asd';
     }
 
@@ -236,6 +382,7 @@ export async function detectSceneLayout(videoStreamUrl, startTime, endTime) {
             const v = await classifyFrame(framePath);
             if (v) votes[v]++;
         } catch (err) {
+            if (isGeminiQuotaError(err)) markGeminiQuotaExhausted();
             logger.warn(`[SceneDetect] Falha ao analisar frame em ${Math.floor(t)}s: ${err.message}`);
         } finally {
             if (framePath && fs.existsSync(framePath)) { try { fs.unlinkSync(framePath); } catch { /* ignora */ } }

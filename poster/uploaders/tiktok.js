@@ -6,6 +6,7 @@ import { chromium } from 'playwright';
 import path from 'node:path';
 import fs from 'node:fs';
 import { logger } from '../logger.js';
+import { humanType, humanClick } from '../human-behavior.js';
 
 // Perfil persistente do Playwright — sessão salva com npm run poster:login
 // Usa o Chrome real como executável para máxima compatibilidade.
@@ -38,12 +39,6 @@ async function launchBrowser(profileDir = DEFAULT_PROFILE_DIR) {
     });
 }
 
-
-async function humanClick(page, selector, timeout = 15000) {
-    const el = await page.waitForSelector(selector, { timeout, state: 'visible' });
-    await page.waitForTimeout(300 + Math.random() * 400);
-    await el.click();
-}
 
 /**
  * Fecha o tour de onboarding (react-joyride) que o TikTok mostra em contas
@@ -101,7 +96,7 @@ async function getUploadFrame(page) {
  * @param {boolean} headless
  * @returns {Promise<boolean>} true = publicado com sucesso confirmado; false = falhou
  */
-export async function uploadToTikTok(filePath, caption, headless = true, profileDir = DEFAULT_PROFILE_DIR) {
+export async function uploadToTikTok(filePath, caption, headless = true, profileDir = DEFAULT_PROFILE_DIR, thumbnailPath = null) {
     logger.step(`[TikTok] Iniciando upload: ${path.basename(filePath)}`);
 
     const context = await launchBrowser(profileDir);
@@ -239,12 +234,59 @@ export async function uploadToTikTok(filePath, caption, headless = true, profile
 
         // Digita via page.keyboard para que o Draft.js receba os eventos corretamente
         const captionTrimmed = caption.slice(0, 2200);
-        await page.keyboard.type(captionTrimmed, { delay: 25 + Math.random() * 30 });
+        await humanType(page, captionTrimmed);
 
         // Fecha autocomplete de hashtags (Escape) e aguarda fechar
         await page.waitForTimeout(500);
         await page.keyboard.press('Escape');
         await page.waitForTimeout(800);
+
+        // 5b. Capa personalizada — mesma imagem gerada pro YouTube (thumbnail.js
+        // já sai em 9:16, compatível com os dois). Fluxo real confirmado ao vivo
+        // em 17/09/2026: clicar em "Editar capa" abre um editor separado
+        // (demora ~10-15s pra carregar de verdade — nem sempre está pronto
+        // assim que o modal aparece), que tem seu próprio input de arquivo
+        // (accept="image/jpeg, image/png, image/jpg", sem precisar clicar em
+        // "Carregar capa" antes — mesmo padrão do input oculto do YouTube).
+        // Nunca bloqueia o post por causa disso: falha aqui só loga e segue.
+        if (thumbnailPath && fs.existsSync(thumbnailPath)) {
+            try {
+                logger.info('[TikTok] Enviando capa personalizada...');
+                const editCapaBtn = uploadFrame.locator('.edit-container', { hasText: 'Editar capa' }).first();
+                await editCapaBtn.click({ timeout: 8000 });
+                // Editor de capa carrega devagar (mede assets do vídeo inteiro) —
+                // poll pelo input de arquivo em vez de timeout fixo curto.
+                const coverFrame = await getUploadFrame(page);
+                const coverInput = await coverFrame.waitForSelector('input[type="file"][accept*="image"]', { timeout: 20000, state: 'attached' });
+                await coverInput.setInputFiles(thumbnailPath);
+                // Confirma que a imagem carregou de verdade antes de salvar (a
+                // preview <img alt="Uploaded cover image"> só aparece depois do
+                // upload terminar de processar no servidor).
+                await coverFrame.waitForSelector('img[alt="Uploaded cover image"]', { timeout: 15000 });
+                await page.waitForTimeout(1000);
+                // Confirma e volta pro formulário principal. O botão real é
+                // button.header-button (fica no cabeçalho do modal, ao lado de
+                // "Cancelar" — NÃO fica dentro de .CoverPicker__root, confirmado
+                // via dump de DOM ao vivo em 17/09/2026). Um seletor genérico
+                // ":has-text('Salvar')" sem esse escopo casava com outro botão
+                // de "salvar rascunho" da página por engano. Além disso, o clique
+                // físico normal é bloqueado por hit-test (.CoverPicker__root
+                // sobrepõe a MESMA coordenada mesmo com o botão visível/habilitado
+                // — "subtree intercepts pointer events") — dispatch via DOM
+                // (el.click()) ignora o hit-test e funciona.
+                const saveBtn = coverFrame.locator('button.header-button:has-text("Salvar")').first();
+                await saveBtn.waitFor({ state: 'visible', timeout: 8000 });
+                await saveBtn.evaluate((el) => el.click());
+                await page.waitForTimeout(1500);
+                logger.success('[TikTok] Capa personalizada enviada.');
+            } catch (coverErr) {
+                logger.warn(`[TikTok] Falha na capa personalizada (${coverErr.message}) — seguindo com a capa padrão.`);
+                // Se o editor de capa ficou aberto e travou o resto do fluxo,
+                // Escape fecha ele sem afetar o formulário principal.
+                await page.keyboard.press('Escape').catch(() => {});
+                await page.waitForTimeout(500);
+            }
+        }
 
         // 6. Clica em "Postar"
         logger.info('[TikTok] Publicando...');
@@ -261,8 +303,12 @@ export async function uploadToTikTok(filePath, caption, headless = true, profile
         let clicked = false;
         for (const sel of POST_BTN_SELECTORS) {
             try {
-                await uploadFrame.waitForSelector(sel, { timeout: 5000, state: 'visible' });
-                await uploadFrame.click(sel);
+                const btnLocator = uploadFrame.locator(sel).first();
+                await btnLocator.waitFor({ state: 'visible', timeout: 5000 });
+                // Clique físico humanizado (curva até o botão via ghost-cursor);
+                // se falhar por qualquer motivo (ex.: boundingBox indisponível),
+                // cai pro clique normal do Playwright em vez de perder a tentativa.
+                await humanClick(page, btnLocator).catch(() => btnLocator.click());
                 clicked = true;
                 logger.info(`[TikTok] Botão publicar clicado (${sel})`);
                 break;

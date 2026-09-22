@@ -127,7 +127,7 @@ async function distributeToExtraAccounts(absPath, title, ytDescription, tikTokCa
  * @returns {Promise<{ youtube: boolean|null, tiktok: boolean|null }>}
  */
 export async function postExpressClip(clipPath, metadata = null, options = {}) {
-    const { ytProfileDir = null, ttProfileDir = null, madeForKids = false } = options;
+    const { ytProfileDir = null, ttProfileDir = null, madeForKids = false, skipTikTok = false } = options;
     ensureDirs();
     ensureArchiveDir();
 
@@ -139,6 +139,16 @@ export async function postExpressClip(clipPath, metadata = null, options = {}) {
     }
 
     logger.step(`[Express] Iniciando postagem expressa: ${path.basename(absPath)}`);
+
+    // ── Interruptor mestre de teste ────────────────────────────────────────────
+    // Mesmo guard de poster/index.js (postVideoJob) — faltava aqui, e é por isso
+    // que POSTER_DRY_RUN=true não impedia o vídeo longo diário (que passa por
+    // este módulo, não por postVideoJob) de publicar de verdade. Checa ANTES de
+    // qualquer geração de metadados ou escrita de registry.
+    if (process.env.POSTER_DRY_RUN === 'true') {
+        logger.warn(`[Express] 🧪 POSTER_DRY_RUN=true — não vou subir "${path.basename(absPath)}" em lugar nenhum.`);
+        return { youtube: null, tiktok: null };
+    }
 
     // ── Guarda anti-duplicata por CONTEÚDO ────────────────────────────────────
     // O registry por caminho não pega compilações regeradas com outro nome
@@ -208,7 +218,9 @@ export async function postExpressClip(clipPath, metadata = null, options = {}) {
         }
 
         // ── TikTok ────────────────────────────────────────────────────────────
-        if (UPLOAD_TT) {
+        if (UPLOAD_TT && skipTikTok) {
+            logger.info('[Express] TikTok pulado (skipTikTok) — postando só no YouTube.');
+        } else if (UPLOAD_TT) {
             if (isTikTokPosted(absPath)) {
                 logger.warn('[Express] Arquivo ja enviado ao TikTok — pulando.');
             } else {

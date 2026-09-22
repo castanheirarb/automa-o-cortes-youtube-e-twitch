@@ -17,7 +17,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 import { logger } from '../utils/logger.js';
-import { scoutTrendingCortes } from './trend-capture.js';
+import { scoutTrendingCortes, isOffTopicByAI } from './trend-capture.js';
 import { sanitizeFilename } from '../utils/helpers.js';
 
 const execFileAsync = promisify(execFile);
@@ -77,6 +77,12 @@ export async function replicateTrendingLongVideo({ maxAttempts = 3 } = {}) {
     fs.mkdirSync(LONG_DIR, { recursive: true });
 
     for (const video of candidates.slice(0, maxAttempts)) {
+        if (await isOffTopicByAI(video.title)) {
+            logger.warn(`[LongReplicate] "${video.title}" classificado como fora do tema (IA) — descartando.`);
+            registerAttempted(video.id);
+            continue;
+        }
+
         registerAttempted(video.id); // antes do download: falha não vira loop
         const destPath = path.join(LONG_DIR, `${sanitizeFilename(video.title)}.mp4`);
         try {

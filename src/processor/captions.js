@@ -40,6 +40,7 @@ const NICHE_STYLES = {
     react:     { highlight: '&H0000FFFF', base: '&H00FFFFFF', fontSize: 78 }, // amarelo (original)
     podcast:   { highlight: '&H0000FFFF', base: '&H00FFFFFF', fontSize: 78 },
     fitness:   { highlight: '&H0000FFFF', base: '&H00FFFFFF', fontSize: 78 },
+    gta6:      { highlight: '&H00FF00FF', base: '&H00FFFFFF', fontSize: 78 }, // rosa/magenta neon (identidade visual GTA VI)
     default:   { highlight: '&H0000FFFF', base: '&H00FFFFFF', fontSize: 78 },
 };
 
@@ -95,7 +96,7 @@ function extractAudio(videoPath) {
 
 // ─── 2. Transcrição com Groq Whisper (timestamps por segmento E por palavra) ──
 
-export async function transcribeWithTimestamps(audioPath) {
+export async function transcribeWithTimestamps(audioPath, language = 'pt') {
     const apiKey = process.env.GROQ_API_KEY?.trim();
     if (!apiKey) throw new Error('GROQ_API_KEY não configurada no .env');
 
@@ -103,8 +104,8 @@ export async function transcribeWithTimestamps(audioPath) {
 
     const response = await groq.audio.transcriptions.create({
         file: fs.createReadStream(audioPath),
-        model: 'whisper-large-v3-turbo',
-        language: 'pt',
+        model: process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3-turbo',
+        language,
         response_format: 'verbose_json',
         timestamp_granularities: ['word', 'segment'],
     });
@@ -165,6 +166,10 @@ export function groupWordsIntoLines(words, maxWordsPerLine = 3, maxGapSec = 0.6)
 // ─── 5. Monta o .ass com destaque de palavra sincronizado (karaokê) ──────────
 
 function buildAssHeader(style, marginV) {
+    // fontName é sobrescrevível (default 'Impact', inalterado pros nichos
+    // existentes) — necessário pra conteúdo em CJK, já que Impact não tem
+    // glifos de chinês/japonês/coreano (ver bilibili/capture.js).
+    const fontName = style.fontName || 'Impact';
     return `[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -173,7 +178,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Impact,${style.fontSize},${style.highlight},${style.base},&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,4,1,2,40,40,${marginV},1
+Style: Default,${fontName},${style.fontSize},${style.highlight},${style.base},&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,4,1,2,40,40,${marginV},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -275,15 +280,19 @@ function burnSubtitles(videoPath, assPath, outputPath) {
  *   @param {string} [opts.layout] Layout do clipe (asd/blur/hybrid/split) — define posição vertical
  * @returns {Promise<string>} Mesmo caminho, agora com legendas queimadas
  */
-export async function addCaptionsToClip(videoPath, { niche = 'default', layout = 'asd' } = {}) {
+export async function addCaptionsToClip(videoPath, { niche = 'default', layout = 'asd', fontName = null, language = 'pt', skipCaptions = false } = {}) {
     if (process.env.ADD_CAPTIONS !== 'true') return videoPath;
+    if (skipCaptions) {
+        logger.info('[Captions] Fonte provavelmente já tem legenda/letra queimada — pulando nossa legenda.');
+        return videoPath;
+    }
 
     logger.step('[Captions] Gerando legendas automáticas com Groq Whisper...');
 
     let audioPath = null;
     let assPath = null;
     const tempOut = videoPath.replace(/\.mp4$/i, '_sub.mp4');
-    const style = getNicheStyle(niche);
+    const style = fontName ? { ...getNicheStyle(niche), fontName } : getNicheStyle(niche);
     const marginV = getLayoutMargin(layout);
 
     try {
@@ -291,7 +300,7 @@ export async function addCaptionsToClip(videoPath, { niche = 'default', layout =
         audioPath = await extractAudio(videoPath);
 
         // 2. Transcreve com timestamps por palavra (e por segmento, como fallback)
-        const { segments, words } = await transcribeWithTimestamps(audioPath);
+        const { segments, words } = await transcribeWithTimestamps(audioPath, language);
         if (!segments.length && !words.length) {
             logger.warn('[Captions] Nenhum segmento encontrado — pulando legendas.');
             return videoPath;

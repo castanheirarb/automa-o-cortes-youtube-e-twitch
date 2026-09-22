@@ -4,16 +4,25 @@
 // Uso:
 //   node start.js                  → Inicia auto-poster + live monitor + yt-monitor + scanner + trend hunter
 //   node start.js --no-live        → Sem monitor de lives Twitch
+//   node start.js --no-tiktok-live → Sem monitor de lives TikTok
+//   node start.js --no-tiktok-backfill → Sem backfill de lives brutas pras personas TikTok
 //   node start.js --no-yt-monitor  → Sem monitor YouTube
 //   node start.js --no-poster      → Sem auto-poster
 //   node start.js --no-hunter      → Sem trend hunter
 //   node start.js --no-sports      → Sem sports monitor (canais de futebol)
 //   node start.js --no-stock       → Sem stock watcher (reposição automática)
 //   node start.js --no-comment-bot → Sem Comment Bot (resposta automática a comentários)
+//   node start.js --no-audience    → Sem painel de audiência periódico
+//   node start.js --no-bilibili    → Sem agendador do Bilibili mainland
 //
 // Pressione Ctrl+C para encerrar todos os serviços.
 
-import 'dotenv/config';
+// override:true — ver nota equivalente em poster/index.js. Sem isso, se o
+// PowerShell/terminal que lançou este processo já tinha alguma variável do
+// projeto "exportada" de um teste anterior, ela venceria o .env do disco pro
+// resto da vida deste processo E de todo filho respawnado por ele.
+import { config as loadDotenv } from 'dotenv';
+loadDotenv({ override: true });
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -22,6 +31,8 @@ import fs from 'node:fs';
 
 const args = process.argv.slice(2);
 const noLive        = args.includes('--no-live');
+const noTiktokLive  = args.includes('--no-tiktok-live');
+const noTiktokBackfill = args.includes('--no-tiktok-backfill');
 const noPoster      = args.includes('--no-poster');
 const noHunter      = args.includes('--no-hunter');
 const noYtMonitor   = args.includes('--no-yt-monitor');
@@ -29,6 +40,8 @@ const noWatchdog    = args.includes('--no-watchdog');
 const noSports      = args.includes('--no-sports');
 const noStock       = args.includes("--no-stock");
 const noCommentBot  = args.includes('--no-comment-bot');
+const noAudience    = args.includes('--no-audience');
+const noBilibili    = args.includes('--no-bilibili');
 const node = process.execPath;
 
 // ─── Instância Única ──────────────────────────────────────────────────────────
@@ -74,8 +87,10 @@ ensureSingleInstance();
 
 const SCAN_HOURS  = parseFloat(process.env.SCAN_INTERVAL_HOURS || '6');
 const HUNT_HOURS  = parseFloat(process.env.TREND_HUNT_HOURS    || '12');
+const TIKTOK_BACKFILL_HOURS = parseFloat(process.env.TIKTOK_BACKFILL_HOURS || '6');
 const STOCK_MINUTES = parseFloat(process.env.STOCK_CHECK_MINUTES || '30');
 const COMMENT_BOT_HOURS = parseFloat(process.env.COMMENT_BOT_HOURS || '24');
+const AUDIENCE_HOURS = parseFloat(process.env.AUDIENCE_CHECK_HOURS || '3');
 
 const SERVICES = [
     {
@@ -93,6 +108,29 @@ const SERVICES = [
         cmd: [node, ['src/orchestrator.js', '--live']],
         enabled: !noLive,
         restartDelay: 15_000,
+    },
+    {
+        id: 'TIKTOK-LIVE',
+        label: '📡 TIKTOK LIVE',
+        color: '\x1b[35m',   // magenta
+        // Orientado a evento (WebSocket) — não precisa de restartDelay curto
+        // como os outros polling loops, mas mantemos por segurança caso a
+        // conexão morra sem disparar reconexão interna.
+        cmd: [node, ['src/orchestrator.js', '--tiktok-live-monitor']],
+        enabled: !noTiktokLive,
+        restartDelay: 15_000,
+    },
+    {
+        id: 'TIKTOK-BACKFILL',
+        label: '🔎 TIKTOK BACKFILL',
+        color: '\x1b[36m',   // ciano
+        // Busca lives brutas/completas já re-hospedadas no YouTube pras
+        // personas TikTok (sem VOD arquivado) — só enquanto a pasta de saída
+        // delas estiver com poucos clipes (ver tiktok-persona-scout.js).
+        // Roda 1 passada e encerra — reinicia a cada TIKTOK_BACKFILL_HOURS.
+        cmd: [node, ['src/orchestrator.js', '--tiktok-backfill']],
+        enabled: !noTiktokBackfill,
+        restartDelay: TIKTOK_BACKFILL_HOURS * 3600 * 1000,
     },
     {
         id: 'SCANNER',
@@ -156,6 +194,33 @@ const SERVICES = [
         cmd: [node, ['src/orchestrator.js', '--comment-monitor', '--once']],
         enabled: !noCommentBot,
         restartDelay: COMMENT_BOT_HOURS * 3600 * 1000,
+    },
+    {
+        id: 'AUDIENCE',
+        label: '📊 AUDIENCE',
+        color: '\x1b[34m',   // azul
+        // Views/likes/comentários dos últimos 3 vídeos de cada canal (Data
+        // API v3, sem depender da Analytics API — ver audience-recent.js).
+        // Views não mudam de forma relevante em poucos minutos, e o custo de
+        // cota é irrisório (~12 unidades/rodada) — 3h é o equilíbrio entre
+        // visão atualizada ao longo do dia e não gerar ruído redundante nos
+        // logs. Roda 1 passada e encerra — reinicia a cada AUDIENCE_CHECK_HOURS.
+        cmd: [node, ['src/scheduler/audience-recent.js']],
+        enabled: !noAudience,
+        restartDelay: AUDIENCE_HOURS * 3600 * 1000,
+    },
+    {
+        id: 'BILIBILI',
+        label: '📅 BILIBILI',
+        color: '\x1b[35m',   // magenta
+        // Agendador do Bilibili mainland (bilibili/schedule.js) — antes exigia
+        // um terminal separado ("npm run bilibili:schedule"), agora entra no
+        // mesmo swarm do npm run poster (pedido do usuário, 17/09/2026). Roda
+        // em loop próprio (cron interno, ver BILIBILI_CRON no .env) — só
+        // reinicia aqui se o processo cair de verdade (crash), não por design.
+        cmd: [node, ['bilibili/schedule.js']],
+        enabled: !noBilibili,
+        restartDelay: 15_000,
     },
     {
         id: 'WATCHDOG',

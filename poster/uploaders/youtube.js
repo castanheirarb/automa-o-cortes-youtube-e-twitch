@@ -7,6 +7,7 @@ import { chromium } from 'playwright';
 import path from 'node:path';
 import fs from 'node:fs';
 import { logger } from '../logger.js';
+import { humanType, humanClick } from '../human-behavior.js';
 
 const DEFAULT_PROFILE_DIR = path.resolve('./profiles/chrome-youtube');
 
@@ -154,7 +155,10 @@ async function tryClick(page, selectors, timeout = 20000) {
                 if (await el.isVisible({ timeout: 1500 })) {
                     await el.scrollIntoViewIfNeeded().catch(() => {});
                     await page.waitForTimeout(300 + Math.random() * 300).catch(() => {});
-                    await el.click();
+                    // Clique físico humanizado (ghost-cursor); se falhar por qualquer
+                    // motivo cai pro clique normal do Playwright — o laço externo
+                    // desta função já tolera e reretenta em caso de exceção.
+                    await humanClick(page, el).catch(() => el.click());
                     return sel;
                 }
             } catch { /* tenta o próximo */ }
@@ -237,7 +241,7 @@ async function fillField(page, el, text) {
         await page.waitForTimeout(150).catch(() => {});
 
         // Digitação real (trusted input) — evita o problema do paste sintético acima
-        await page.keyboard.type(text, { delay: 20 + Math.random() * 20 });
+        await humanType(page, text);
         await page.waitForTimeout(400).catch(() => {});
         // NÃO pressiona Escape aqui: quando não há popup de autocomplete aberto
         // (comum ao digitar o título), o Escape fecha o MODAL DE UPLOAD INTEIRO
@@ -509,27 +513,16 @@ export async function uploadToYouTube(filePath, title, description = '', headles
             try {
                 logger.info('[YouTube] Enviando thumbnail personalizada...');
 
-                // O input de arquivo fica oculto até clicar em "Miniatura personalizada"
-                const THUMB_BTN_SELECTORS = [
-                    'ytcp-thumbnails-compact-editor-uploader',
-                    '[aria-label*="miniatura"]',
-                    '[aria-label*="thumbnail"]',
-                    ':text("Fazer upload de uma miniatura")',
-                    ':text("Upload thumbnail")',
-                    ':text("Miniatura personalizada")',
-                    ':text("Custom thumbnail")',
-                ];
-                for (const sel of THUMB_BTN_SELECTORS) {
-                    try {
-                        const btn = page.locator(sel).first();
-                        if (await btn.isVisible({ timeout: 2000 })) {
-                            await btn.click().catch(() => {});
-                            await page.waitForTimeout(800).catch(() => {});
-                            break;
-                        }
-                    } catch { /* tenta o próximo */ }
-                }
-
+                // NÃO clicar em nada antes: o input#file-loader já fica attached no
+                // DOM (só oculto visualmente) desde que o modal de detalhes abre —
+                // setInputFiles funciona em input[type=file] oculto, não precisa de
+                // clique pra "revelar". Um clique aqui é só risco: o seletor genérico
+                // que existia antes ([aria-label*="miniatura"]) batia primeiro no link
+                // real "Saiba mais sobre as miniaturas" da UI (a[aria-label="Saiba
+                // mais sobre as miniaturas"]) — clicar nisso abre o artigo de ajuda do
+                // YouTube ("Adicionar miniaturas personalizadas no YouTube") em vez do
+                // seletor de arquivo, e a thumbnail nunca é enviada de verdade
+                // (achado em produção, relatado pelo usuário em 17/09/2026).
                 const thumbInput = await page.waitForSelector(SEL.thumbnailInput, { timeout: 10000, state: 'attached' });
                 await thumbInput.setInputFiles(thumbnailPath);
                 await page.waitForTimeout(2500).catch(() => {});

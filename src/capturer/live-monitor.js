@@ -96,7 +96,7 @@ async function captureFromLive(persona, streamInfo) {
         logger.step(`[LiveCapture] Iniciando gravação de ${CAPTURE_MIN} min...`);
 
         const [recorded, chatDensity] = await Promise.all([
-            recordLiveStream(loginName, CAPTURE_MIN),
+            recordLiveStream({ url: `https://www.twitch.tv/${loginName}`, label: loginName, minutesToRecord: CAPTURE_MIN }),
             monitorChatDensity(loginName, CAPTURE_MIN * 60),
         ]);
 

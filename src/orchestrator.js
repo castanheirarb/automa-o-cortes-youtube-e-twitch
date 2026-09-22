@@ -7,6 +7,9 @@
 //   node src/orchestrator.js cariani --force   → força re-captação
 //   node src/orchestrator.js --live            → monitor de lives Twitch (loop contínuo)
 //   node src/orchestrator.js --live alanzoka   → monitora só o alanzoka ao vivo
+//   node src/orchestrator.js --tiktok-live-monitor → monitor de lives TikTok (orientado a evento)
+//   node src/orchestrator.js --tiktok-backfill → busca lives brutas/completas já re-hospedadas
+//                                                  no YouTube pras personas TikTok (roda 1x e encerra)
 //   node src/orchestrator.js --comment-monitor → Comment Bot (responde comentários do YouTube via API)
 //   node src/orchestrator.js --comment-monitor main --dry-run --once → 1 ciclo de teste, só canal principal
 
@@ -22,6 +25,8 @@ async function main() {
 
     const args = process.argv.slice(2);
     const liveMode         = args.includes('--live');
+    const tiktokLiveMode   = args.includes('--tiktok-live-monitor');
+    const tiktokBackfillMode = args.includes('--tiktok-backfill');
     const huntMode         = args.includes('--hunt');
     const ytMonitorMode    = args.includes('--youtube-monitor');
     const sportsMonitorMode = args.includes('--sports-monitor');
@@ -96,6 +101,13 @@ async function main() {
 
         await startYouTubeMonitor(filterNames);
 
+    } else if (tiktokBackfillMode) {
+        // ── Modo Backfill TikTok (lives brutas re-hospedadas no YouTube) ──────
+        logger.info('[Orchestrator] Modo Backfill TikTok ativado.');
+        const { runTikTokPersonaBackfill } = await import('./trend-hunter/tiktok-persona-scout.js');
+        const results = await runTikTokPersonaBackfill();
+        const total = results.reduce((s, r) => s + (r.clipsGenerated || 0), 0);
+        logger.success(`[Orchestrator] Backfill TikTok: ${total} clipe(s) gerado(s) no total.`);
     } else if (huntMode) {
         // ── Modo Trend Hunter ─────────────────────────────────────────────────
         logger.info('[Orchestrator] Modo Trend Hunter ativado.');
@@ -134,6 +146,27 @@ async function main() {
 
         await startLiveMonitor(filterNames);
 
+    } else if (tiktokLiveMode) {
+        // ── Modo Monitor de Lives (TikTok) ────────────────────────────────────
+        const { startTikTokLiveMonitor } = await import('./capturer/live-monitor-tiktok.js');
+
+        const filterNames = namedArgs.length > 0 ? namedArgs : [];
+
+        console.log('\x1b[35m');
+        console.log('═'.repeat(56));
+        console.log('  📡  CANAL CORTE — Monitor de Lives (TikTok)');
+        if (filterNames.length > 0) {
+            console.log(`  Monitorando: ${filterNames.join(', ')}`);
+        } else {
+            const tiktok = PERSONAS.filter((p) => p.platform === 'tiktok').map((p) => p.displayName);
+            console.log(`  Monitorando ${tiktok.length} canal(is): ${tiktok.join(', ')}`);
+        }
+        console.log('  Pressione Ctrl+C para encerrar.');
+        console.log('═'.repeat(56));
+        console.log('\x1b[0m');
+
+        await startTikTokLiveMonitor(filterNames);
+
     } else {
         // ── Modo VOD (YouTube + Twitch arquivado) ─────────────────────────────
         const targetName = namedArgs[0];
@@ -148,7 +181,11 @@ async function main() {
             }
             await capturePersona(persona, { force, minClips: 3 });
         } else {
-            await captureAll(PERSONAS, { force, minClips: 3 });
+            // Personas 'tiktok' são live-only (sem VOD acessível) — ficam de
+            // fora da varredura normal, senão toda passada do Scanner loga um
+            // "erro" de plataforma desconhecida pra elas.
+            const vodPersonas = PERSONAS.filter((p) => p.platform !== 'tiktok');
+            await captureAll(vodPersonas, { force, minClips: 3 });
         }
     }
 }

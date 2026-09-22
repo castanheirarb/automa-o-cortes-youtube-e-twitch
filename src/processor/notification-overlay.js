@@ -25,10 +25,18 @@ const SOUND_PATH = path.resolve(process.env.NOTIFICATION_SOUND_PATH || './assets
 const LOGO_DIR = path.resolve('./assets/logos');
 
 const CHANNEL_BRANDING = {
-    canalinfantil: { appName: 'Canal Infantil', logoPath: path.join(LOGO_DIR, 'canal-infantil.jpg') },
-    lucasneto: { appName: 'Canal Infantil', logoPath: path.join(LOGO_DIR, 'canal-infantil.jpg') },
-    bispobrunoleonardo: { appName: 'Canal da Fé', logoPath: path.join(LOGO_DIR, 'canal-da-fe.jpg') },
-    canaldafe: { appName: 'Canal da Fé', logoPath: path.join(LOGO_DIR, 'canal-da-fe.jpg') },
+    // Renomeado em 17/09/2026 (a pedido): "Canal Infantil" → "FÃS DO LUCCAS NETO".
+    canalinfantil: { appName: 'FÃS DO LUCCAS NETO', logoPath: path.join(LOGO_DIR, 'canal-infantil.jpg') },
+    lucasneto: { appName: 'FÃS DO LUCCAS NETO', logoPath: path.join(LOGO_DIR, 'canal-infantil.jpg') },
+    // Renomeado em 17/09/2026 (a pedido): canal "Canal da Fé" não existe mais,
+    // o canal religioso atual se chama "Fé Move Montanhas"
+    // (youtube.com/@FéMoveMontanhasAmém).
+    bispobrunoleonardo: { appName: 'Fé Move Montanhas', logoPath: path.join(LOGO_DIR, 'canal-da-fe.jpg') },
+    canaldafe: { appName: 'Fé Move Montanhas', logoPath: path.join(LOGO_DIR, 'canal-da-fe.jpg') },
+    // Faltava — todo clipe do GTA6 Hunter caía no fallback (Corte Certo 034)
+    // e mostrava a notificação errada. Logo baixada do avatar real do canal
+    // (@FOCONOGTAVI) via YouTube Data API em 08/09/2026.
+    gta6hunter: { appName: 'FOCO NO GTAVI', logoPath: path.join(LOGO_DIR, 'gta6.jpg') },
 };
 const DEFAULT_BRANDING = { appName: 'Corte Certo 034', logoPath: path.join(LOGO_DIR, 'corte-certo-034.jpg') };
 
@@ -275,7 +283,7 @@ export async function addNotificationPopup(inputPath, outputPath, opts = {}) {
                     '-f', 'mp4',
                 ])
                 .output(outputPath)
-                .on('start', (cmd) => logger.info(`[NotificationOverlay] ${cmd.slice(0, 240)}`))
+                .on('start', () => logger.info('[NotificationOverlay] Aplicando popups...'))
                 .on('end', resolve)
                 .on('error', (err) => reject(new Error(`FFmpeg (notification overlay): ${err.message}`)))
                 .run();

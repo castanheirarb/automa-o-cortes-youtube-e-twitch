@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import { fetchLatestYouTubeVideo, fetchYouTubeVideoList, fetchTwitchVODList } from './fetcher.js';
 import { getYoutubePeaks } from '../platforms/youtube.js';
 import { getTwitchLivePeaks } from '../platforms/twitch-peaks.js';
-import { processClip, initBinaries, SubscriberOnlyError } from '../processor/ffmpeg.js';
+import { processClip, initBinaries, SubscriberOnlyError, StaticClipError } from '../processor/ffmpeg.js';
 import { logger } from '../utils/logger.js';
 
 const OUTPUT_BASE = path.resolve(process.env.OUTPUT_DIR || './output');
@@ -196,8 +196,8 @@ export async function capturePersona(persona, { force = false, minClips = 3, dyn
         logger.step(`[Capturer] Capturando alvo dinâmico: "${dynamicTarget.title}"`);
         const personaDir = ensurePersonaDir(persona.name);
 
+        let peaks = [];
         try {
-            let peaks;
             if (dynamicTarget.platform === 'twitch') {
                 peaks = await getTwitchLivePeaks({
                     broadcasterId: dynamicTarget.video_id,
@@ -212,25 +212,50 @@ export async function capturePersona(persona, { force = false, minClips = 3, dyn
             } else {
                 peaks = await getYoutubePeaks(dynamicTarget.url, persona.clipsPerRun ?? 3);
             }
-
-            let generated = 0;
-            for (let i = 0; i < peaks.length; i++) {
-                try {
-                    // outputBaseDir passado diretamente — evita mutação de process.env.OUTPUT_DIR
-                    // que causava race condition quando múltiplas personas rodavam em paralelo
-                    await processClip({ ...peaks[i], videoUrl: dynamicTarget.url, outputBaseDir: personaDir, skipCaptions: persona.skipCaptions === true, layout: persona.layout ?? null, niche: persona.niche ?? 'default' }, i + 1, peaks.length);
-                    generated++;
-                } catch (err) {
-                    logger.error(`[Capturer] Clipe ${i + 1} falhou: ${err.message}`);
-                }
-            }
-
-            logger.success(`[Capturer] Alvo dinâmico: ${generated} clipe(s) gerado(s)`);
-            return { persona: persona.name, clipsGenerated: generated };
         } catch (err) {
-            logger.error(`[Capturer] Falha ao capturar alvo dinâmico: ${err.message}`);
-            return { persona: persona.name, clipsGenerated: 0, error: err.message };
+            const isHeatmapErr = err.message.includes('heatmap') || err.message.includes('Most Replayed');
+            if (!isHeatmapErr) logger.warn(`[Capturer] Falha ao buscar peaks do alvo dinâmico: ${err.message}`);
         }
+
+        // Sem heatmap/peaks → picos uniformemente espaçados no PRÓPRIO alvo
+        // dinâmico, mesmo fallback do caminho normal (findYoutubePeaks/
+        // findTwitchPeaks acima). Sem isso, um "alvo em alta" recém-postado —
+        // o caso comum, já que é exatamente o que o Trend Hunter busca — nunca
+        // gera clipe: o YouTube ainda não acumulou dado de "Most Replayed"
+        // pra vídeo com poucas horas. Opt-out com uniformPeaksFallback: false.
+        if ((!peaks || peaks.length === 0) && persona.uniformPeaksFallback !== false && dynamicTarget.duration > 0) {
+            const n = persona.clipsPerRun ?? 3;
+            const start = dynamicTarget.duration * 0.1;
+            const span = dynamicTarget.duration * 0.8;
+            peaks = Array.from({ length: n }, (_, i) => ({
+                peakTime: start + ((i + 0.5) / n) * span,
+                peakValue: 0,
+                title: dynamicTarget.title,
+                duration: dynamicTarget.duration,
+                videoUrl: dynamicTarget.url,
+            }));
+            logger.warn(`[Capturer] Sem heatmap/peaks no alvo dinâmico "${dynamicTarget.title}" — fallback: ${n} pico(s) uniformes.`);
+        }
+
+        if (!peaks || peaks.length === 0) {
+            logger.error(`[Capturer] Falha ao capturar alvo dinâmico: sem peaks disponíveis para "${dynamicTarget.title}".`);
+            return { persona: persona.name, clipsGenerated: 0, error: 'sem peaks disponíveis' };
+        }
+
+        let generated = 0;
+        for (let i = 0; i < peaks.length; i++) {
+            try {
+                // outputBaseDir passado diretamente — evita mutação de process.env.OUTPUT_DIR
+                // que causava race condition quando múltiplas personas rodavam em paralelo
+                await processClip({ ...peaks[i], videoUrl: dynamicTarget.url, outputBaseDir: personaDir, skipCaptions: persona.skipCaptions === true, layout: persona.layout ?? null, niche: persona.niche ?? 'default' }, i + 1, peaks.length);
+                generated++;
+            } catch (err) {
+                logger.error(`[Capturer] Clipe ${i + 1} falhou: ${err.message}`);
+            }
+        }
+
+        logger.success(`[Capturer] Alvo dinâmico: ${generated} clipe(s) gerado(s)`);
+        return { persona: persona.name, clipsGenerated: generated };
     }
 
     const personaDir = ensurePersonaDir(persona.name);
@@ -282,6 +307,10 @@ export async function capturePersona(persona, { force = false, minClips = 3, dyn
                     subscriberOnlyBlocked = true;
                     logger.warn(`[Capturer] VOD subscriber-only — abortando clipes restantes do VOD.`);
                     break; // todos os clipes do mesmo VOD vão falhar igual
+                }
+                if (err instanceof StaticClipError) {
+                    logger.warn(`[Capturer] ${err.message} — abortando clipes restantes deste vídeo (mesma imagem em todo lugar).`);
+                    break; // vídeo inteiro é a mesma imagem — os outros picos vão dar o mesmo resultado
                 }
                 logger.error(`[Capturer] Clipe ${i + 1} falhou: ${err.message}`);
             }

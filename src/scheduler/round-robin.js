@@ -86,6 +86,20 @@ export function getCurrentPersona(personas) {
 // CazéTV + Trend Hunter de futebol via output/sports-vod).
 export const FOOTBALL_TURN_NAME = 'futebol';
 
+// Turno diário garantido pros cortes de TikTok Live (Weslay Alemão, MC
+// Feijuca, Buzeira, Ana McQueen) na conta principal — pedido explícito do
+// usuário em 07/09/2026: peso sozinho não bastava (cada lote de
+// POSTS_PER_PERSONA já consome quase o dia inteiro de uma persona só, um
+// ciclo completo do rodízio grande levava mais de uma semana pra voltar
+// nessas 4). Ao contrário do futebol (intercala a cada lote fechado), esse é
+// gated por DATA — no máximo 1x por dia, verificado toda vez que roda o
+// ciclo de upload, independente de fechamento de lote de qualquer persona.
+export const TIKTOK_LIVE_TURN_NAME = 'tiktoklive';
+
+function todayKey() {
+    return new Date().toLocaleDateString('en-CA', { timeZone: process.env.TIMEZONE || 'America/Sao_Paulo' });
+}
+
 /**
  * Avança o índice global e salva no disco.
  * Deve ser chamado APÓS um post bem-sucedido (ou após fallback com post em outra persona).
@@ -102,6 +116,17 @@ export function advanceQueue(personaName) {
         state.lastPersona = personaName;
         saveState(state);
         logger.info('[RoundRobin] Turno de futebol concluído — retomando rodízio normal.');
+        return;
+    }
+
+    // Turno de TikTok Live: marca a data de hoje como já atendida (não conta
+    // pro lote/índice de ninguém) — só volta a ficar pendente amanhã.
+    if (personaName === TIKTOK_LIVE_TURN_NAME) {
+        state.lastTikTokTurnDate = todayKey();
+        state.lastPost = new Date().toISOString();
+        state.lastPersona = personaName;
+        saveState(state);
+        logger.info('[RoundRobin] Turno diário de TikTok Live concluído — próximo só amanhã.');
         return;
     }
 
@@ -160,6 +185,14 @@ export function canPersonaPostAgain(personaName) {
  */
 export function isFootballTurnPending() {
     return loadState().pendingFootball === true;
+}
+
+/**
+ * true quando ainda não houve turno de TikTok Live hoje (data local).
+ * @returns {boolean}
+ */
+export function isTikTokLiveTurnPending() {
+    return loadState().lastTikTokTurnDate !== todayKey();
 }
 
 /**

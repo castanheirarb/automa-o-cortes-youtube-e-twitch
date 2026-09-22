@@ -14,6 +14,7 @@ const POSTED_DIR = path.resolve('./postados');
 const REGISTRY_PATH = path.join(POSTED_DIR, 'registry.json');
 const TIKTOK_REGISTRY_PATH = path.join(POSTED_DIR, 'tiktok-registry.json');
 const YOUTUBE_REGISTRY_PATH = path.join(POSTED_DIR, 'youtube-registry.json');
+const INSTAGRAM_REGISTRY_PATH = path.join(POSTED_DIR, 'instagram-registry.json');
 
 // ─── Registry (deduplicação) ──────────────────────────────────────────────────
 
@@ -223,6 +224,55 @@ export function registerYouTubePosted(filePath) {
     registry.add(key);
     saveYouTubeRegistry(registry);
     logger.info(`[Queue] Registrado no youtube-registry: ${key}`);
+}
+
+// ─── Registry Instagram (deduplicação por plataforma) ────────────────────────
+// Mesmo padrão do tiktok-registry/youtube-registry: registra ANTES de iniciar
+// o upload para que uma interrupção do processo não cause re-postagem.
+
+function loadInstagramRegistry() {
+    try {
+        if (fs.existsSync(INSTAGRAM_REGISTRY_PATH)) {
+            const data = JSON.parse(fs.readFileSync(INSTAGRAM_REGISTRY_PATH, 'utf-8'));
+            return new Set(Array.isArray(data) ? data : []);
+        }
+    } catch (err) {
+        logger.warn(`[Queue] Falha ao ler instagram-registry.json: ${err.message} — usando registry vazio.`);
+    }
+    return new Set();
+}
+
+function saveInstagramRegistry(registry) {
+    ensureDirs();
+    try {
+        fs.writeFileSync(INSTAGRAM_REGISTRY_PATH, JSON.stringify([...registry], null, 2), 'utf-8');
+    } catch (err) {
+        logger.warn(`[Queue] Falha ao salvar instagram-registry.json: ${err.message}`);
+    }
+}
+
+/**
+ * Verifica se um arquivo já foi enviado ao Instagram (tentado ou confirmado).
+ * @param {string} filePath - caminho absoluto do arquivo
+ * @returns {boolean}
+ */
+export function isInstagramPosted(filePath) {
+    const registry = loadInstagramRegistry();
+    const key = registryKey(filePath);
+    return registry.has(key) || registry.has(path.basename(filePath));
+}
+
+/**
+ * Registra um arquivo como enviado ao Instagram.
+ * Deve ser chamado ANTES de iniciar o upload para evitar duplicatas em caso de crash.
+ * @param {string} filePath - caminho absoluto do arquivo
+ */
+export function registerInstagramPosted(filePath) {
+    const registry = loadInstagramRegistry();
+    const key = registryKey(filePath);
+    registry.add(key);
+    saveInstagramRegistry(registry);
+    logger.info(`[Queue] Registrado no instagram-registry: ${key}`);
 }
 
 // ─── Dirs ─────────────────────────────────────────────────────────────────────

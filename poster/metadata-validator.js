@@ -155,6 +155,18 @@ const TIKTOK_RULES = {
     },
 };
 
+const IG_RULES = {
+    caption: {
+        maxLen: 2200,
+        warnLen: 150,
+        minLen: 20,
+        forbidden: ['#adulto', '#18+', '#xxx', '#nsfw', '#porno', '#spam'],
+        // Sem #shorts (nem equivalente) — não existe hashtag obrigatória pro Reels.
+        maxHashtags: 8,
+        minHashtags: 3,
+    },
+};
+
 // ─── Validação Principal ──────────────────────────────────────────────────────
 
 export function validateMetadata(metadata, { isLongVideo = false, isGenerated = false } = {}) {
@@ -437,6 +449,53 @@ export function validateTikTokCaption(caption) {
     }
 
     for (const forbidden of TIKTOK_RULES.caption.forbidden) {
+        if (caption.toLowerCase().includes(forbidden)) {
+            errors.push(`Hashtag proibida: '${forbidden}'`);
+            score -= 50;
+        }
+    }
+
+    return { valid: errors.length === 0, errors, warnings, score: Math.max(0, score) };
+}
+
+export function validateInstagramCaption(caption) {
+    const errors = [];
+    const warnings = [];
+    let score = 100;
+
+    if (!caption || caption.trim().length === 0) {
+        return { valid: false, errors: ['Caption vazio'], warnings: [], score: 0 };
+    }
+
+    const safety = checkContentSafety(caption);
+    if (!safety.safe) {
+        errors.push(`Caption contém linguagem ofensiva: '${safety.matches.slice(0, 3).join(', ')}'`);
+        score -= 60;
+    }
+
+    if (caption.length > IG_RULES.caption.maxLen) {
+        errors.push(`Caption excede limite (${caption.length}/${IG_RULES.caption.maxLen})`);
+        score -= 30;
+    }
+
+    if (caption.length > IG_RULES.caption.warnLen) {
+        warnings.push(`Caption longo — pode ser cortado com "...mais" (${caption.length} chars)`);
+        score -= 5;
+    }
+
+    const tagList = caption.match(/#\w+/g) || [];
+
+    if (tagList.length < IG_RULES.caption.minHashtags) {
+        warnings.push(`Poucas hashtags (${tagList.length})`);
+        score -= 10;
+    }
+
+    if (tagList.length > IG_RULES.caption.maxHashtags) {
+        warnings.push(`Muitas hashtags (${tagList.length}) — Instagram pune excesso mais que o TikTok`);
+        score -= 10;
+    }
+
+    for (const forbidden of IG_RULES.caption.forbidden) {
         if (caption.toLowerCase().includes(forbidden)) {
             errors.push(`Hashtag proibida: '${forbidden}'`);
             score -= 50;

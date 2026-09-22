@@ -2,6 +2,7 @@
 // Módulo Thumbnail Creator Pro: Gera thumbnails profissionais com direção de IA (Gemini 2.5 Pro).
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import Groq from 'groq-sdk';
 import sharp from 'sharp';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -11,6 +12,7 @@ import { promisify } from 'node:util';
 import { logger } from '../utils/logger.js';
 import { extractBestFrame } from './face-detect.js';
 import { PERSONAS_MAP } from '../capturer/personas.js';
+import { isGeminiQuotaExhausted, isGeminiQuotaError, markGeminiQuotaExhausted } from '../utils/gemini-quota-guard.js';
 
 function getNicheFromPath(videoPath) {
     const parts = videoPath.split(path.sep);
@@ -70,6 +72,46 @@ REGRAS:
     return parsed;
 }
 
+// 1b. Fallback de direção de arte: Groq (mesma chave/modelo já usado pra
+// título/descrição em poster/metadata.js) — só texto, sem visão, então
+// reaproveita GROQ_COPY_MODEL em vez de introduzir modelo/env var novo.
+// Existia um fallback manual fixo aqui antes (buildManualArtDirection),
+// direto sem tentar outra IA — essa etapa era a única do projeto que não
+// tentava Groq quando o Gemini falhava.
+async function getGroqArtDirection(transcript, title, thumbText = '', niche = 'default') {
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) throw new Error('GROQ_API_KEY não configurada.');
+
+    const groq = new Groq({ apiKey });
+    const prompt = `Você é um diretor de arte de thumbnails para canais de cortes virais do YouTube. Gere um JSON com instruções visuais para a biblioteca sharp.
+
+Nicho do Canal: ${niche}
+Título do Vídeo: "${title}"
+Texto sugerido para thumb: "${thumbText || ''}"
+Transcrição (trecho): "${(transcript || '').substring(0, 400)}"
+
+REGRAS:
+1. "text": 3-5 palavras em CAIXA ALTA que COMPLEMENTEM o título (NÃO repita). ZERO palavrões.
+2. "textColor": cor de alto contraste (#FFFFFF ou #FFD700 ou #FF0000)
+3. "strokeColor": sempre "#000000"
+4. "backgroundColor": cor de fundo (hex) — tons escuros ou vibrantes
+5. "layout": "text-left", "text-right" ou "text-center"
+6. "font": "Impact" ou "Arial Black"
+
+Responda APENAS com o JSON: {"text":"...","textColor":"#FFFFFF","strokeColor":"#000000","backgroundColor":"#8B0000","layout":"text-center","font":"Impact"}`;
+
+    const completion = await groq.chat.completions.create({
+        model: process.env.GROQ_COPY_MODEL || 'openai/gpt-oss-120b',
+        reasoning_effort: 'low',
+        max_tokens: 300,
+        temperature: 0.5,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'user', content: prompt }],
+    });
+
+    return JSON.parse(completion.choices[0].message.content);
+}
+
 // 2. Composição da Thumbnail com Sharp
 async function composeThumbnail(framePath, artDirection, outputPath) {
     // Suporta formato novo {text, textColor, strokeColor, layout, font}
@@ -80,8 +122,15 @@ async function composeThumbnail(framePath, artDirection, outputPath) {
     const font = artDirection.font || 'Impact';
     const layout = artDirection.layout || 'text-center';
 
-    const width = 1280;
-    const height = 720;
+    // 1080x1920 (9:16) — o vídeo-fonte já é vertical (Shorts/TikTok/Reels), não
+    // 16:9. Antes disso aqui saía 1280x720: sharp.resize() sem 'fit' explícito
+    // usa 'cover' por padrão, então um frame vertical virava um recorte bem
+    // apertado (zoom agressivo, perdendo boa parte do enquadramento) em vez de
+    // simplesmente encaixar. Corrigido pra bater com o formato real — a MESMA
+    // imagem gerada aqui serve pra YouTube Shorts e TikTok (thumb.js é
+    // compartilhado entre os dois, ver poster/index.js).
+    const width = 1080;
+    const height = 1920;
 
     const xPos = layout === 'text-left' ? '25%' : layout === 'text-right' ? '75%' : '50%';
 
@@ -159,7 +208,7 @@ export async function createProfessionalThumbnail(videoPath, metadata) {
         // a. Extrai o melhor frame do vídeo via Gemini Vision; fallback simples se sem chave
         let framePath = await extractBestFrame(videoPath);
         if (!framePath) {
-            logger.info('[Thumbnail] Sem GEMINI_API_KEY — extraindo frame simples (sem IA)...');
+            logger.info('[Thumbnail] Nenhum provedor de visão disponível pra escolher o frame — extraindo frame simples (sem IA)...');
             framePath = await extractFallbackFrame(videoPath);
         }
         if (!framePath) {
@@ -167,15 +216,16 @@ export async function createProfessionalThumbnail(videoPath, metadata) {
             return null;
         }
 
-        // b. Obtém direção de arte da IA (fallback sem API key)
+        // b. Obtém direção de arte da IA (fallback sem API key, cota esgotada,
+        // ou qualquer outra falha do Gemini — nunca deixa a exceção derrubar a
+        // thumbnail inteira quando o frame já foi extraído com sucesso, como
+        // acontecia antes desse guard: visto em produção em 06/09/2026, onde
+        // "Falha ao criar thumbnail" descartava a thumbnail toda por causa só
+        // da etapa de direção de arte, mesmo com o frame pronto em mãos).
         const niche = getNicheFromPath(videoPath);
-        let artDirection;
-        if (process.env.GEMINI_API_KEY?.trim()) {
-            artDirection = await getAIArtDirection(metadata.transcript || '', metadata.titulo, metadata.thumbText || '', niche);
-            logger.info(`[Thumbnail] Direção de Arte: "${artDirection.text}" | Layout: ${artDirection.layout} | Font: ${artDirection.font}`);
-        } else {
+        const buildManualArtDirection = () => {
             const words = (metadata.thumbText || metadata.titulo || '').split(' ').slice(0, 4).join(' ');
-            artDirection = {
+            return {
                 text: words,
                 textColor: '#FFFFFF',
                 strokeColor: '#000000',
@@ -183,7 +233,29 @@ export async function createProfessionalThumbnail(videoPath, metadata) {
                 layout: 'text-center',
                 font: 'Impact',
             };
-            logger.info(`[Thumbnail] Direção de Arte (fallback): "${artDirection.text}"`);
+        };
+
+        let artDirection = null;
+        if (process.env.GEMINI_API_KEY?.trim() && !isGeminiQuotaExhausted()) {
+            try {
+                artDirection = await getAIArtDirection(metadata.transcript || '', metadata.titulo, metadata.thumbText || '', niche);
+                logger.info(`[Thumbnail] Direção de Arte (Gemini): "${artDirection.text}" | Layout: ${artDirection.layout} | Font: ${artDirection.font}`);
+            } catch (err) {
+                if (isGeminiQuotaError(err)) markGeminiQuotaExhausted();
+                logger.warn(`[Thumbnail] Direção de arte via Gemini falhou (${err.message}) — tentando Groq...`);
+            }
+        }
+        if (!artDirection && process.env.GROQ_API_KEY) {
+            try {
+                artDirection = await getGroqArtDirection(metadata.transcript || '', metadata.titulo, metadata.thumbText || '', niche);
+                logger.info(`[Thumbnail] Direção de Arte (Groq): "${artDirection.text}" | Layout: ${artDirection.layout} | Font: ${artDirection.font}`);
+            } catch (err) {
+                logger.warn(`[Thumbnail] Direção de arte via Groq também falhou (${err.message}) — usando fallback manual.`);
+            }
+        }
+        if (!artDirection) {
+            artDirection = buildManualArtDirection();
+            logger.info(`[Thumbnail] Direção de Arte (fallback manual): "${artDirection.text}"`);
         }
 
         // c. Compõe a thumbnail

@@ -72,13 +72,20 @@ const execFileAsync = promisify(execFile);
 //   filtro padrão de 3600s.
 // Candidato rejeitado na mesma pesquisa: "TV Oração" (@TVOração) — inativo,
 // último vídeo com vários meses (não dá pra contar como fonte confiável).
+//
+// Fonte PRINCIPAL (19/09/2026, a pedido do usuário): Congregação Cristã no
+// Brasil vem primeiro na lista — a busca por candidatos percorre os canais
+// nesta ordem e empilha os elegíveis, então o primeiro canal da lista é
+// quem efetivamente prioriza a fila de download. Os outros dois só entram
+// quando a Congregação não tiver vídeo elegível novo (registry) na janela
+// de duração.
 const PRAYER_LIVE_CHANNELS = [
-    { url: 'https://www.youtube.com/@OracoesPoderosasOficial/videos', label: 'Orações Poderosas Oficial (Nivaldo Bildhauer)' },
-    { url: 'https://www.youtube.com/@ictv.online/videos', label: 'Igreja da Cidade (ICTV)' },
     // /streams, não /videos — esse canal não expõe aba "Vídeos" padrão
     // (yt-dlp retorna "This channel does not have a videos tab"); /streams
     // funciona e lista os cultos ao vivo passados normalmente.
     { url: 'https://www.youtube.com/channel/UC4cfCNEpwLIuYnxdDKUMPYg/streams', label: 'Congregação Cristã no Brasil' },
+    { url: 'https://www.youtube.com/@OracoesPoderosasOficial/videos', label: 'Orações Poderosas Oficial (Nivaldo Bildhauer)' },
+    { url: 'https://www.youtube.com/@ictv.online/videos', label: 'Igreja da Cidade (ICTV)' },
 ];
 
 const REGISTRY_FILE = path.resolve('./scheduler/long-video-fe-registry.json');

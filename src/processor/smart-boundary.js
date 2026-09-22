@@ -47,7 +47,7 @@ async function transcribeWithTimestamps(audioPath) {
     const groq = new Groq({ apiKey });
     const response = await groq.audio.transcriptions.create({
         file: fs.createReadStream(audioPath),
-        model: 'whisper-large-v3-turbo',
+        model: process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3-turbo',
         language: 'pt',
         response_format: 'verbose_json',
         timestamp_granularities: ['segment'],

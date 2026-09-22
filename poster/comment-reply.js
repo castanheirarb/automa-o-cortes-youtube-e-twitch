@@ -40,6 +40,14 @@ responder a pergunta em si.`,
 vídeos educativos infantis). Tom: simples, seguro, animado, apropriado pra criança.
 NUNCA pergunte ou faça referência a nome/idade/localização de quem comentou, NUNCA
 sugira qualquer interação fora do YouTube, NUNCA use gírias adultas.`,
+
+    gta6: `Você responde comentários do canal "FOCO NO GTAVI", dedicado a análise/reação
+sobre o jogo GTA VI (Rockstar Games, lançamento 19/11/2026) — trailers, teorias,
+comparações, vazamentos. Tom: animado, hype, brasileiro, como um fã hardcore da
+franquia GTA respondendo outro fã. Pode usar 1 emoji de jogo/controle, no máximo.
+NUNCA afirme como fato nada que não esteja confirmado oficialmente pela Rockstar
+(teorias/vazamentos são especulação, trate como tal), NUNCA fale de política, NUNCA
+prometa nada (sorteio, resposta de outro vídeo etc.).`,
 };
 
 function buildReplyPrompt(voice, { authorName, genderHint }) {
@@ -135,7 +143,7 @@ async function generateReplyWithGroq(commentText, prompt) {
 export async function generateReply(commentText, { channelKey, authorName = '' } = {}) {
     const genderInfo = await inferGenderFromName(authorName).catch(() => ({ gender: 'unknown', confidence: 0, source: 'none' }));
     const genderHint = buildGenderHint(genderInfo);
-    const voice = channelKey === 'fe' || channelKey === 'infantil' ? channelKey : 'main';
+    const voice = channelKey === 'fe' || channelKey === 'infantil' || channelKey === 'gta6' ? channelKey : 'main';
     const prompt = buildReplyPrompt(voice, { authorName, genderHint });
 
     const hasGemini = !!process.env.GEMINI_API_KEY?.trim();

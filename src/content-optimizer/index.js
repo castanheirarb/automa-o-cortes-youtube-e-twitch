@@ -4,23 +4,33 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { logger } from '../../poster/logger.js';
 import { sanitizeMetadataText } from '../../poster/content-filter.js';
+import { isGeminiQuotaExhausted, isGeminiQuotaError, markGeminiQuotaExhausted } from '../utils/gemini-quota-guard.js';
 
-const OPTIMIZER_PROMPT = `Você é um especialista em CTR (Click-Through Rate) do YouTube. Gere 3 variantes de títulos virais para o mesmo vídeo. A melhor variante deve ser a primeira da lista.
+const OPTIMIZER_PROMPT = `Você é uma pessoa de verdade revisando um título antes de postar, tentando
+deixá-lo mais interessante sem parecer clickbait de bot. Gere 3 variantes do
+mesmo título. A melhor variante deve ser a primeira da lista.
 
 Título Original: "{{originalTitle}}"
 Transcrição: "{{transcript}}"
 
-Fórmulas de Sucesso (inspire-se, NÃO copie literalmente):
-- REAÇÃO: "[STREAMER] REAGE: [ASSUNTO SURPREENDENTE]"
-- REVELAÇÃO: "SEI A VERDADE SOBRE [ASSUNTO POLÊMICO]"
-- CONFRONTO: "[PESSOA] BRIGOU/SAIU/CHOROU AO VIVO"
-- PERGUNTA CHOCANTE: "[ASSUNTO] É UM CAMINHO SEM VOLTA?"
-- CITAÇÃO DIRETA: "\\"[FRASE MARCANTE]\\" - NOME"
-- FAIL/HUMOR: "[STREAMER] PASSOU A MAIOR VERGONHA AO VIVO"
+ÂNGULOS POSSÍVEIS (são ideias de ASSUNTO, não moldes de frase — nunca "RÓTULO
+EM CAIXA ALTA: frase entre aspas" toda vez; varie a estrutura de cada variante):
+- reação genuína a algo surpreendente no clipe
+- revelação de um detalhe específico (não genérico)
+- uma pergunta curta e real sobre o que acontece
+- citação direta de uma frase marcante do próprio clipe
+- constatação simples/direta, sem forçar drama
 
-REGRAS:
+COMO SOA HUMANO (evite, denuncia texto de bot):
+- Repetir a mesma estrutura nas 3 variantes — varie de verdade (uma pode ser
+  pergunta, outra afirmação, outra citação)
+- Exagerar em CAIXA ALTA — no máximo 1-2 palavras em destaque por variante,
+  às vezes zero; o resto em minúsculas normais
+- Frases genéricas que serviriam pra qualquer vídeo do canal — seja
+  específico sobre o que REALMENTE acontece nesse clipe
+
+REGRAS INVIOLÁVEIS:
 - 40-70 caracteres cada variante
-- CAIXA ALTA em palavras-chave para impacto
 - ZERO palavrões ou linguagem ofensiva
 - Não revele o final do vídeo — crie gancho de curiosidade
 - Cada variante deve usar uma abordagem diferente
@@ -31,6 +41,7 @@ Responda APENAS com JSON válido:
 export async function optimizeContent(metadata) {
     const apiKey = process.env.GEMINI_API_KEY?.trim();
     if (!apiKey || !metadata.titulo || !metadata.transcript) return metadata;
+    if (isGeminiQuotaExhausted()) return metadata;
 
     logger.info('[Optimizer] Gerando 3 variantes de título para máximo CTR...');
 
@@ -77,6 +88,7 @@ export async function optimizeContent(metadata) {
         }
         return metadata;
     } catch (err) {
+        if (isGeminiQuotaError(err)) markGeminiQuotaExhausted();
         logger.warn(`[Optimizer] Falha: ${err.message}. Usando título original.`);
         return metadata;
     }

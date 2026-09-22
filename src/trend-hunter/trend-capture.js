@@ -19,6 +19,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
+import Groq from 'groq-sdk';
 import { logger } from '../utils/logger.js';
 import { capturePersona } from '../capturer/capturer.js';
 
@@ -29,6 +30,76 @@ const DEFAULT_CORTES_CHANNELS = [
     'https://www.youtube.com/@CortesdoInteligencia/videos',
     'https://www.youtube.com/@PodpahCortes/videos',
 ];
+
+// Filtro de assunto por palavra-chave no TÍTULO — os 3 canais acima são de
+// "cortes" genéricos (podcast/entrevista), então às vezes o vídeo mais visto
+// do dia é sobre um assunto fora do tema do canal (já aconteceu 2x: conteúdo
+// político publicado sem relação nenhuma com o canal, tanto num Short quanto
+// no vídeo longo — os dois consomem esta mesma função). Termos institucionais
+// genéricos, sem citar partido/político específico, pra não parecer viés —
+// o objetivo é só manter o canal no tema de cortes de entretenimento, não
+// tomar posição em nada.
+const DEFAULT_BLOCKLIST_KEYWORDS = [
+    'política', 'eleição', 'eleições', 'eleitoral', 'presidente', 'presidência',
+    'stf', 'supremo tribunal', 'congresso nacional', 'câmara dos deputados', 'senado federal',
+    'ministro', 'ministério', 'candidato', 'candidatura', 'urna eletrônica', 'tse',
+];
+
+function getBlocklistKeywords() {
+    const raw = process.env.TREND_BLOCKLIST_KEYWORDS?.trim();
+    if (!raw) return DEFAULT_BLOCKLIST_KEYWORDS;
+    const parsed = raw.split(',').map((k) => k.trim().toLowerCase()).filter(Boolean);
+    return parsed.length > 0 ? parsed : DEFAULT_BLOCKLIST_KEYWORDS;
+}
+
+function isOffTopic(title) {
+    const t = (title || '').toLowerCase();
+    return getBlocklistKeywords().some((kw) => t.includes(kw));
+}
+
+// ─── Segunda camada: classificação por IA (título em qualquer idioma) ────────
+// O filtro por palavra-chave acima só pega termos institucionais em
+// português — um título em inglês sobre política brasileira ("IS BRAZIL'S
+// FISCAL BOMB ABOUT TO EXPLODE? - KIM KATAGUIRI AND GLENN GREENWALD",
+// reproduzido em teste real) passa direto. Só chamado nos candidatos FINAIS
+// (dentro de maxAttempts em captureTrendClip/replicateTrendingLongVideo), não
+// nos ~30 vídeos escaneados — poucas chamadas por ciclo. Groq com
+// reasoning_effort:'low' (mesmo padrão de poster/metadata.js — sem isso o
+// modelo estoura max_tokens com raciocínio interno). Falha aberta: se a IA
+// cair, deixa passar (o filtro de palavra-chave já rodou antes) em vez de
+// travar a captura inteira por causa de uma checagem extra.
+export async function isOffTopicByAI(title) {
+    const apiKey = process.env.GROQ_API_KEY?.trim();
+    if (!apiKey) return false;
+
+    try {
+        const groq = new Groq({ apiKey });
+        const completion = await groq.chat.completions.create({
+            model: process.env.GROQ_COPY_MODEL || 'openai/gpt-oss-120b',
+            // reasoning_effort:'low' NÃO elimina o raciocínio interno do
+            // gpt-oss-120b, só reduz — com max_tokens baixo o modelo gasta
+            // tudo raciocinando e corta antes de emitir SIM/NAO
+            // (finish_reason:"length", content vazio, reproduzido em teste
+            // real). Mesma lição documentada em poster/metadata.js: margem
+            // generosa, não o mínimo teórico da resposta esperada.
+            reasoning_effort: 'low',
+            max_tokens: 300,
+            temperature: 0,
+            messages: [
+                {
+                    role: 'system',
+                    content: 'Você classifica títulos de vídeo pra um canal de cortes de entretenimento (podcast/reação/games). Responda APENAS "SIM" se o título for sobre política, eleições, governo, ou notícia/polêmica institucional — mesmo em outro idioma. Responda APENAS "NAO" para qualquer outro assunto (entretenimento, jogos, esporte, humor, relacionamento, etc.).',
+                },
+                { role: 'user', content: title },
+            ],
+        });
+        const raw = completion.choices[0]?.message?.content?.trim().toUpperCase() ?? '';
+        return raw.startsWith('SIM');
+    } catch (err) {
+        logger.warn(`[TrendCapture] Classificação por IA falhou (${err.message}) — seguindo sem essa checagem extra.`);
+        return false;
+    }
+}
 
 const REGISTRY_FILE = path.resolve('./scheduler/trend-registry.json');
 
@@ -108,9 +179,15 @@ export async function scoutTrendingCortes() {
         }
     }
 
-    all.sort((a, b) => b.views - a.views);
-    logger.success(`[TrendCapture] ${all.length} vídeos encontrados — top: "${all[0]?.title}" (${all[0]?.views} views)`);
-    return all;
+    const filtered = all.filter((v) => !isOffTopic(v.title));
+    const blocked = all.length - filtered.length;
+    if (blocked > 0) {
+        logger.warn(`[TrendCapture] ${blocked} vídeo(s) descartado(s) por assunto fora do tema (política/institucional).`);
+    }
+
+    filtered.sort((a, b) => b.views - a.views);
+    logger.success(`[TrendCapture] ${filtered.length} vídeos encontrados — top: "${filtered[0]?.title}" (${filtered[0]?.views} views)`);
+    return filtered;
 }
 
 // ─── Captura: baixa e corta o vídeo em alta via pipeline normal ──────────────
@@ -136,6 +213,12 @@ export async function captureTrendClip({ maxAttempts = 4 } = {}) {
     }
 
     for (const video of candidates.slice(0, maxAttempts)) {
+        if (await isOffTopicByAI(video.title)) {
+            logger.warn(`[TrendCapture] "${video.title}" classificado como fora do tema (IA) — descartando.`);
+            registerAttempted(video.id);
+            continue;
+        }
+
         logger.step(`[TrendCapture] 🔥 Em alta: "${video.title}" (${video.views} views) — capturando...`);
         registerAttempted(video.id); // registra antes: falha não vira loop infinito
 
